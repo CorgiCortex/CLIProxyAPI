@@ -16,11 +16,22 @@ import (
 )
 
 const (
-	freebuffProvider = "freebuff"
-	freebuffModel    = "deepseek/deepseek-v4-flash"
-	freebuffAgent    = "base3-free-deepseek-flash"
-	freebuffPrompt   = "You are Buffy, the coding agent behind Codebuff."
+	freebuffProvider             = "freebuff"
+	freebuffDeepSeekV4ProModel   = "deepseek/deepseek-v4-pro"
+	freebuffDeepSeekV4FlashModel = "deepseek/deepseek-v4-flash"
+	freebuffGPT56LunaModel       = "openai/gpt-5.6-luna"
+	freebuffMiniMaxM3Model       = "minimax/minimax-m3"
+	freebuffMiMo25Model          = "mimo/mimo-v2.5"
+	freebuffPrompt               = "You are Buffy, the coding agent behind Codebuff."
 )
+
+var freebuffAgentByModel = map[string]string{
+	freebuffDeepSeekV4ProModel:   "base3-free-deepseek",
+	freebuffDeepSeekV4FlashModel: "base3-free-deepseek-flash",
+	freebuffGPT56LunaModel:       "base3-free-luna",
+	freebuffMiniMaxM3Model:       "base3-free-minimax-m3",
+	freebuffMiMo25Model:          "base3-free-mimo",
+}
 
 type freebuffSession struct {
 	Status     string `json:"status"`
@@ -37,7 +48,8 @@ func (e *OpenAICompatExecutor) isFreebuff() bool {
 }
 
 func (e *OpenAICompatExecutor) prepareFreebuffRequest(ctx context.Context, client *http.Client, auth *cliproxyauth.Auth, baseURL, apiKey, model string, payload []byte) ([]byte, string, error) {
-	if model != freebuffModel {
+	agentID, ok := freebuffAgentByModel[model]
+	if !ok {
 		return nil, "", fmt.Errorf("freebuff: unsupported model %q", model)
 	}
 
@@ -62,7 +74,7 @@ func (e *OpenAICompatExecutor) prepareFreebuffRequest(ctx context.Context, clien
 	if err != nil {
 		return nil, "", err
 	}
-	runID, err := e.startFreebuffRun(ctx, client, auth, baseURL, apiKey)
+	runID, err := e.startFreebuffRun(ctx, client, auth, baseURL, apiKey, agentID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -80,20 +92,30 @@ func (e *OpenAICompatExecutor) prepareFreebuffRequest(ctx context.Context, clien
 }
 
 func (e *OpenAICompatExecutor) freebuffInstance(ctx context.Context, client *http.Client, auth *cliproxyauth.Auth, baseURL, apiKey, model string) (string, error) {
-	// ponytail: one account owns one session; shard locks by credential only if acquisition latency matters.
-	e.freebuffMu.Lock()
-	defer e.freebuffMu.Unlock()
 	var session freebuffSession
-	if err := e.freebuffJSON(ctx, client, auth, http.MethodGet, strings.TrimSuffix(baseURL, "/")+"/freebuff/session", apiKey, nil, nil, &session); err != nil {
+	sessionURL := strings.TrimSuffix(baseURL, "/") + "/freebuff/session"
+	if err := e.freebuffJSON(ctx, client, auth, http.MethodGet, sessionURL, apiKey, nil, nil, &session); err != nil {
 		var statusError statusErr
 		if !errors.As(err, &statusError) || statusError.StatusCode() != http.StatusNotFound {
 			return "", err
 		}
 		session.Status = "none"
 	}
+	if session.Status == "active" && session.Model == model {
+		if session.InstanceID == "" {
+			return "", fmt.Errorf("freebuff: active session returned no instanceId")
+		}
+		return session.InstanceID, nil
+	}
+	if session.Status == "active" || session.Status == "ended" {
+		if err := e.freebuffJSON(ctx, client, auth, http.MethodDelete, sessionURL, apiKey, nil, nil, nil); err != nil {
+			return "", err
+		}
+		session.Status = "none"
+	}
 	if session.Status == "none" {
 		headers := http.Header{"x-freebuff-model": []string{model}}
-		if err := e.freebuffJSON(ctx, client, auth, http.MethodPost, strings.TrimSuffix(baseURL, "/")+"/freebuff/session", apiKey, headers, nil, &session); err != nil {
+		if err := e.freebuffJSON(ctx, client, auth, http.MethodPost, sessionURL, apiKey, headers, nil, &session); err != nil {
 			return "", err
 		}
 	}
@@ -103,8 +125,8 @@ func (e *OpenAICompatExecutor) freebuffInstance(ctx context.Context, client *htt
 	return session.InstanceID, nil
 }
 
-func (e *OpenAICompatExecutor) startFreebuffRun(ctx context.Context, client *http.Client, auth *cliproxyauth.Auth, baseURL, apiKey string) (string, error) {
-	body, err := json.Marshal(map[string]any{"action": "START", "agentId": freebuffAgent, "ancestorRunIds": []string{}})
+func (e *OpenAICompatExecutor) startFreebuffRun(ctx context.Context, client *http.Client, auth *cliproxyauth.Auth, baseURL, apiKey, agentID string) (string, error) {
+	body, err := json.Marshal(map[string]any{"action": "START", "agentId": agentID, "ancestorRunIds": []string{}})
 	if err != nil {
 		return "", err
 	}

@@ -42,8 +42,9 @@ const (
 // It performs request/response translation and executes against the provider base URL
 // using per-auth credentials (API key) and per-auth HTTP transport (proxy) from context.
 type OpenAICompatExecutor struct {
-	provider   string
-	cfg        *config.Config
+	provider string
+	cfg      *config.Config
+	// ponytail: all Freebuff traffic is serial; shard locks by credential if multiple accounts need throughput.
 	freebuffMu sync.Mutex
 }
 
@@ -146,7 +147,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	if e.isFreebuff() {
+	freebuffRequest := e.isFreebuff()
+	if freebuffRequest {
+		e.freebuffMu.Lock()
+		defer e.freebuffMu.Unlock()
 		var runID string
 		translated, runID, err = e.prepareFreebuffRequest(ctx, httpClient, auth, baseURL, apiKey, baseModel, translated)
 		if err != nil {
@@ -170,7 +174,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	if e.isFreebuff() {
+	if freebuffRequest {
 		httpReq.Header.Set("User-Agent", "ai-sdk/openai-compatible/codebuff")
 	} else {
 		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
@@ -377,7 +381,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	var freebuffRunID string
-	if e.isFreebuff() {
+	freebuffRequest := e.isFreebuff()
+	freebuffLocked := false
+	if freebuffRequest {
+		e.freebuffMu.Lock()
+		freebuffLocked = true
+		defer func() {
+			if freebuffLocked {
+				e.freebuffMu.Unlock()
+			}
+		}()
 		translated, freebuffRunID, err = e.prepareFreebuffRequest(ctx, httpClient, auth, baseURL, apiKey, baseModel, translated)
 		if err != nil {
 			return nil, err
@@ -396,7 +409,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	if e.isFreebuff() {
+	if freebuffRequest {
 		httpReq.Header.Set("User-Agent", "ai-sdk/openai-compatible/codebuff")
 	} else {
 		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
@@ -450,7 +463,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	unlockFreebuffInStream := freebuffLocked
+	freebuffLocked = false
 	go func() {
+		if unlockFreebuffInStream {
+			defer e.freebuffMu.Unlock()
+		}
 		defer close(out)
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
