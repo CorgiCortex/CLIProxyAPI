@@ -523,6 +523,19 @@ nonstream-keepalive-interval: 0
 #         alias: "claude-opus-4.66"
 #       - name: "kimi-k2.5"
 #         alias: "claude-opus-4.66"
+#   - name: "freebuff" # Special adapter: manages Freebuff session/run metadata around each request.
+#     base-url: "https://www.codebuff.com/api/v1"
+#     api-key-entries:
+#       - api-key: "your Freebuff authToken from ~/.config/manicode/credentials.json"
+#     models:
+#       - name: "deepseek/deepseek-v4-flash"
+#         alias: "deepseek-v4-flash"
+#         display-name: "Freebuff DeepSeek V4 Flash"
+#         max-context-length: 1048576
+#         input-modalities: [text]
+#         output-modalities: [text]
+#         thinking:
+#           levels: ["low", "high", "max"]
 
 # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 # vertex-api-key:

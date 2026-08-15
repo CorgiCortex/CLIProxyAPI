@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -13,6 +14,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,8 +42,9 @@ const (
 // It performs request/response translation and executes against the provider base URL
 // using per-auth credentials (API key) and per-auth HTTP transport (proxy) from context.
 type OpenAICompatExecutor struct {
-	provider string
-	cfg      *config.Config
+	provider   string
+	cfg        *config.Config
+	freebuffMu sync.Mutex
 }
 
 // NewOpenAICompatExecutor creates an executor bound to a provider key (e.g., "openrouter").
@@ -142,6 +145,21 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	if e.isFreebuff() {
+		var runID string
+		translated, runID, err = e.prepareFreebuffRequest(ctx, httpClient, auth, baseURL, apiKey, baseModel, translated)
+		if err != nil {
+			return resp, err
+		}
+		defer func() {
+			status := "completed"
+			if err != nil {
+				status = "failed"
+			}
+			err = errors.Join(err, e.finishFreebuffRun(ctx, httpClient, auth, baseURL, apiKey, runID, status))
+		}()
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -152,7 +170,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.isFreebuff() {
+		httpReq.Header.Set("User-Agent", "ai-sdk/openai-compatible/codebuff")
+	} else {
+		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -176,9 +198,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	trackedHTTPClient := reporter.TrackHTTPClient(httpClient)
+	httpResp, err := trackedHTTPClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -351,17 +372,32 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	var freebuffRunID string
+	if e.isFreebuff() {
+		translated, freebuffRunID, err = e.prepareFreebuffRequest(ctx, httpClient, auth, baseURL, apiKey, baseModel, translated)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
+		if freebuffRunID != "" {
+			err = errors.Join(err, e.finishFreebuffRun(ctx, httpClient, auth, baseURL, apiKey, freebuffRunID, "failed"))
+		}
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.isFreebuff() {
+		httpReq.Header.Set("User-Agent", "ai-sdk/openai-compatible/codebuff")
+	} else {
+		httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -387,11 +423,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	trackedHTTPClient := reporter.TrackHTTPClient(httpClient)
+	httpResp, err := trackedHTTPClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		if freebuffRunID != "" {
+			err = errors.Join(err, e.finishFreebuffRun(ctx, httpClient, auth, baseURL, apiKey, freebuffRunID, "failed"))
+		}
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -403,6 +441,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		if freebuffRunID != "" {
+			err = errors.Join(err, e.finishFreebuffRun(ctx, httpClient, auth, baseURL, apiKey, freebuffRunID, "failed"))
+		}
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -423,6 +464,21 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var streamAborted bool
 		var upstreamEvent string
 		var frameData [][]byte
+		defer func() {
+			if freebuffRunID == "" {
+				return
+			}
+			status := "completed"
+			if streamFailed || streamAborted {
+				status = "failed"
+			}
+			if errFinish := e.finishFreebuffRun(ctx, httpClient, auth, baseURL, apiKey, freebuffRunID, status); errFinish != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: errFinish}:
+				case <-ctx.Done():
+				}
+			}
+		}()
 		defer streamUsage.Publish(ctx, reporter)
 
 		publishStreamError := func(streamErr statusErr, containsPayload bool) {
@@ -530,6 +586,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			return
 		}
 		if errScan != nil {
+			streamFailed = true
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
