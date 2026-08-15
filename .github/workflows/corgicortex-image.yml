@@ -2,7 +2,7 @@ name: CorgiCortex image
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
 
 concurrency:
