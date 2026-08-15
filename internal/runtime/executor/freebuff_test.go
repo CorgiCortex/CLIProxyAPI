@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -57,7 +58,7 @@ func TestFreebuffRequestLifecycle(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewOpenAICompatExecutor(freebuffProvider, &config.Config{})
+	executor := NewOpenAICompatExecutor(util.OpenAICompatibleProviderKey(freebuffProvider), &config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL + "/api/v1", "api_key": "token"}}
 	response, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   freebuffModel,

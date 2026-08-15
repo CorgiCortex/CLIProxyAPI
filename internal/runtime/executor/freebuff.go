@@ -33,7 +33,7 @@ type freebuffRun struct {
 }
 
 func (e *OpenAICompatExecutor) isFreebuff() bool {
-	return strings.EqualFold(strings.TrimSpace(e.provider), freebuffProvider)
+	return strings.EqualFold(strings.TrimSpace(e.provider), util.OpenAICompatibleProviderKey(freebuffProvider))
 }
 
 func (e *OpenAICompatExecutor) prepareFreebuffRequest(ctx context.Context, client *http.Client, auth *cliproxyauth.Auth, baseURL, apiKey, model string, payload []byte) ([]byte, string, error) {
