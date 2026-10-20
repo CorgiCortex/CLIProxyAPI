@@ -9,6 +9,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps/zcode"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
@@ -88,6 +89,11 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 	published := true
 	var models []*ModelInfo
 	switch provider {
+	case "zcode":
+		if credential, errCredential := zcode.ReadCredential(a); errCredential == nil {
+			models = buildConfigModels(credential.Models, "zcode", "zcode", "zcode")
+		}
+		models = applyExcludedModels(models, excluded)
 	case constant.Gemini:
 		models = registry.GetGeminiModels()
 		if entry := resolveConfigGeminiKeyForConfig(cfg, a); entry != nil {

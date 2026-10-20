@@ -115,6 +115,8 @@ func main() {
 	var kimiAILogin bool
 	var xaiLogin bool
 	var devinLogin bool
+	var zcodeLogin bool
+	var zcodeFamily, zcodePlan string
 	var metaLogin bool
 	var discoverGateways bool
 	var discoverTimeout int
@@ -145,6 +147,9 @@ func main() {
 	flag.BoolVar(&kimiAILogin, "kimi-ai-login", false, "Login to Kimi.ai using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
 	flag.BoolVar(&devinLogin, "devin-login", false, "Login to Devin using OAuth")
+	flag.BoolVar(&zcodeLogin, "zcode-login", false, "Login to ZCode using OAuth")
+	flag.StringVar(&zcodeFamily, "zcode-family", "zai", "ZCode family: zai or bigmodel")
+	flag.StringVar(&zcodePlan, "zcode-plan", "start-plan", "ZCode plan: start-plan or coding-plan")
 	flag.BoolVar(&metaLogin, "meta-login", false, "Login to Meta using OAuth")
 	flag.BoolVar(&discoverGateways, "discover", false, "Discover local AI gateways and CPA instances on the LAN")
 	flag.IntVar(&discoverTimeout, "discover-timeout", 3, "Timeout in seconds for LAN discovery (default 3s)")
@@ -658,7 +663,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || siwcBind != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || xaiLogin || devinLogin || metaLogin
+	commandMode := vertexImport != "" || siwcBind != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || xaiLogin || devinLogin || metaLogin || zcodeLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
@@ -739,6 +744,8 @@ func main() {
 		cmd.DoXAILogin(cfg, options)
 	} else if devinLogin {
 		cmd.DoDevinLogin(cfg, options)
+	} else if zcodeLogin {
+		cmd.DoZCodeLogin(cfg, options, zcodeFamily, zcodePlan)
 	} else if metaLogin {
 		cmd.DoMetaLogin(cfg, options)
 	} else {
@@ -964,7 +971,7 @@ func argvEnablesBoolFlag(args []string, name string) bool {
 func argvFlagConsumesValue(name string) bool {
 	switch name {
 	case "codex-login", "codex-device-login", "claude-login", "no-browser",
-		"antigravity-login", "kimi-login", "kimi-ai-login", "xai-login", "devin-login", "meta-login",
+		"antigravity-login", "kimi-login", "kimi-ai-login", "xai-login", "devin-login", "meta-login", "zcode-login",
 		"discover", "discover-json", "home-disable-cluster-discovery",
 		"tui", "standalone", "local-model":
 		return false

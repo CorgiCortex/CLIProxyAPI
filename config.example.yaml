@@ -334,6 +334,14 @@ client:
 
 # Shared upstream behavior applies to OAuth and API-key credentials.
 upstream:
+  # Native ZCode accounts are stored under oauth.auth-dir with type: zcode.
+  # See docs/zcode.md for account import and the isolated verification worker.
+  zcode:
+    app-version: "3.16.2"
+    captcha-url: "http://127.0.0.1:8318"
+    max-concurrent: 1
+    min-interval-ms: 1000
+    start-plan-system: ""
   codex:
     # Experimental full-duplex Codex Responses WebSocket steering (default: false).
     # Keeps one upstream account/model per socket; accepted input is never replayed.
