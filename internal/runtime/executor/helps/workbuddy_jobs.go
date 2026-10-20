@@ -78,6 +78,7 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 	var failures []error
 	policy := cfg.WorkBuddy.Jobs
 	probeCount := 0
+	scanCount := 0
 	for _, auth := range records {
 		if err := ctx.Err(); err != nil {
 			return changed, err
@@ -172,12 +173,18 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 		}
 		if len(probe) > 0 && (policy.QuotaScan || policy.ResetProbes) {
 			plans := r.Governor.DueResetProbes(c)
+			pendingReset := make(map[string]bool, len(plans))
+			for _, plan := range plans {
+				pendingReset[plan.Model] = true
+			}
 			if !policy.ResetProbes {
 				plans = nil
 			}
 			if policy.QuotaScan {
 				for _, model := range workbuddy.FreeProbeModels(c.Realm) {
-					plans = append(plans, workbuddy.ResetProbe{Model: model})
+					if !pendingReset[model] && !r.Governor.Capped(c, model) {
+						plans = append(plans, workbuddy.ResetProbe{Model: model})
+					}
 				}
 			}
 			for _, plan := range plans {
@@ -188,6 +195,12 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 				if plan.ResetAt.IsZero() {
 					job = "quota_scan:" + plan.Model
 					slot, _ = workbuddy.JobSlot(time.Now(), "quota")
+					if errSchedule := r.Jobs.PrepareQuota(c, plan.Model, slot); errSchedule != nil {
+						return changed, errSchedule
+					}
+					if scanCount >= 6 {
+						continue
+					}
 				}
 				_, _, errProbe := r.Jobs.Run(ctx, c, job, slot, func(ctx context.Context) (workbuddy.JobReceipt, error) {
 					if _, errLoad := load(); errLoad != nil {
@@ -203,6 +216,9 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 						}
 					}
 					probeCount++
+					if plan.ResetAt.IsZero() {
+						scanCount++
+					}
 					return workbuddy.JobReceipt{}, probe[0](ctx, r.Current(auth), plan.Model)
 				})
 				if errProbe != nil {

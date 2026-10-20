@@ -205,3 +205,89 @@ func TestWorkBuddyResetProbeUsesShortRetryAndTwentyAttemptBudget(t *testing.T) {
 		t.Fatal("reset retry budget exceeded")
 	}
 }
+
+func TestWorkBuddyQuotaScheduleSurvivesRestartAndSlotBoundary(t *testing.T) {
+	now := time.Date(2026, 10, 21, 21, 59, 59, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "jobs.json")
+	ledger, err := OpenJobLedger(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testCredential()
+	second := first
+	second.UID = "second-quota-fixture"
+	slot, _ := JobSlot(now, "quota")
+	if err = ledger.PrepareQuota(first, "hy3", slot); err != nil {
+		t.Fatal(err)
+	}
+	if err = ledger.PrepareQuota(second, "hy3", slot); err != nil {
+		t.Fatal(err)
+	}
+	firstKey := RiskAccountKey(first) + ":quota_scan:hy3:" + slot
+	secondKey := RiskAccountKey(second) + ":quota_scan:hy3:" + slot
+	if ledger.state.Receipts[firstKey].NextAttempt.Sub(now) != 5*time.Second || ledger.state.Receipts[secondKey].NextAttempt.Sub(now) != 20*time.Second {
+		t.Fatal("first scans were not staggered")
+	}
+	ledger, err = OpenJobLedger(path, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	run := func(context.Context) (JobReceipt, error) { calls++; return JobReceipt{}, nil }
+	now = now.Add(4 * time.Second)
+	nextSlot, _ := JobSlot(now, "quota")
+	if nextSlot == slot {
+		t.Fatal("fixture did not cross a six-hour boundary")
+	}
+	if _, ran, _ := ledger.Run(context.Background(), first, "quota_scan:hy3", nextSlot, run); ran {
+		t.Fatal("slot rollover bypassed persisted initial delay")
+	}
+	now = now.Add(time.Second)
+	if _, ran, errRun := ledger.Run(context.Background(), first, "quota_scan:hy3", nextSlot, run); !ran || errRun != nil {
+		t.Fatal("due scan did not run")
+	}
+	now = now.Add(6*time.Hour - time.Second)
+	thirdSlot, _ := JobSlot(now, "quota")
+	if _, ran, _ := ledger.Run(context.Background(), first, "quota_scan:hy3", thirdSlot, run); ran {
+		t.Fatal("slot rollover shortened the six-hour scan interval")
+	}
+	now = now.Add(time.Second)
+	if _, ran, errRun := ledger.Run(context.Background(), first, "quota_scan:hy3", thirdSlot, run); !ran || errRun != nil || calls != 2 {
+		t.Fatal("six-hour scan did not resume")
+	}
+}
+
+func TestWorkBuddyQuotaRetryBudgetDoesNotResetAtSlotBoundary(t *testing.T) {
+	now := time.Date(2026, 10, 21, 21, 59, 0, 0, time.UTC)
+	ledger, err := OpenJobLedger(filepath.Join(t.TempDir(), "jobs.json"), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := testCredential()
+	calls := 0
+	run := func(context.Context) (JobReceipt, error) {
+		calls++
+		return JobReceipt{}, errors.New("fixture quota failure")
+	}
+	var last time.Time
+	for i := 1; i <= 6; i++ {
+		slot, _ := JobSlot(now, "quota")
+		receipt, ran, errRun := ledger.Run(context.Background(), c, "quota_scan:hy3", slot, run)
+		if !ran || errRun == nil || receipt.Attempts != i {
+			t.Fatalf("attempt %d: receipt=%+v ran=%v err=%v", i, receipt, ran, errRun)
+		}
+		last = now
+		now = now.Add(15 * time.Minute)
+	}
+	now = last.Add(6*time.Hour - time.Second)
+	slot, _ := JobSlot(now, "quota")
+	if _, ran, _ := ledger.Run(context.Background(), c, "quota_scan:hy3", slot, run); ran {
+		t.Fatal("slot rollover restarted exhausted retry budget early")
+	}
+	now = now.Add(time.Second)
+	slot, _ = JobSlot(now, "quota")
+	receipt, ran, errRun := ledger.Run(context.Background(), c, "quota_scan:hy3", slot, run)
+	if !ran || errRun == nil || receipt.Attempts != 1 || calls != 7 {
+		t.Fatal("new quota period did not reset attempt budget")
+	}
+}

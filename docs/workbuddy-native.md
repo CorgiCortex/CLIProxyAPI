@@ -103,7 +103,11 @@ Background operations now share chat's governor, connection pools and limiter:
 - Optional quota scans use the three known free-cap models as applicable to the
   realm. Reset probes wait for the recorded reset time; both execute through the
   native chat path with paid fallback and product switching disabled. Each cycle
-  admits at most 16 probes, with 400 ms spacing.
+  admits at most 16 probes, including at most six quota scans, with 400 ms spacing.
+  New quota pairs start after five seconds and are staggered by 15 seconds up to
+  one hour; the schedule survives restart. Successful scans remain at least six
+  hours apart even across a scheduling-slot boundary. Registered cap windows are
+  handled only by reset probes until recovery is observed.
 - Atomic job receipts precede actions. Completed slots survive restart; ordinary
   failures retry after 15 minutes, at most six times per slot. Reset failures
   retry after at least 15 seconds, at most 20 times per reset window, subject to

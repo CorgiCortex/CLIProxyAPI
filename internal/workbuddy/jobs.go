@@ -82,6 +82,44 @@ func (l *JobLedger) Run(ctx context.Context, c Credential, job, slot string, run
 		return receipt, false, err
 	}
 	now := l.now()
+	if strings.HasPrefix(job, "quota_scan:") {
+		var latest JobReceipt
+		for previousKey, previous := range l.state.Receipts {
+			if previous.Account == account && previous.Job == job && previous.StartedAt.After(latest.StartedAt) {
+				latest = previous
+			}
+			if previous.Account == account && previous.Job == job && previous.Status == "scheduled" {
+				if now.Before(previous.NextAttempt) {
+					l.mu.Unlock()
+					return previous, false, nil
+				}
+				if previousKey != key {
+					delete(l.state.Receipts, previousKey)
+				}
+			}
+			if previous.Account == account && previous.Job == job && previous.Status == "success" && now.Before(previous.FinishedAt.Add(6*time.Hour)) {
+				l.mu.Unlock()
+				return previous, false, nil
+			}
+		}
+		if latest.Slot != slot && (latest.Status == "failed" || latest.Status == "pending") {
+			until := latest.NextAttempt
+			lastAttempt := latest.FinishedAt
+			if lastAttempt.IsZero() {
+				lastAttempt = latest.StartedAt
+			}
+			if latest.Attempts >= 6 && lastAttempt.Add(6*time.Hour).After(until) {
+				until = lastAttempt.Add(6 * time.Hour)
+			}
+			if now.Before(until) {
+				l.mu.Unlock()
+				return latest, false, nil
+			}
+			if latest.Attempts < 6 {
+				receipt.Attempts = latest.Attempts
+			}
+		}
+	}
 	maxAttempts, retryDelay := 6, 15*time.Minute
 	if strings.HasPrefix(job, "reset_probe:") {
 		maxAttempts, retryDelay = 20, 15*time.Second
@@ -139,6 +177,42 @@ func (l *JobLedger) Run(ctx context.Context, c Credential, job, slot string, run
 		return receipt, true, errSave
 	}
 	return receipt, true, err
+}
+
+// PrepareQuota spreads newly observed account/model pairs over the initial
+// hour. Persisting the schedule prevents a restart from bursting the whole pool.
+func (l *JobLedger) PrepareQuota(c Credential, model, slot string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.saveErr != nil {
+		return l.saveErr
+	}
+	account, job := RiskAccountKey(c), "quota_scan:"+model
+	for _, receipt := range l.state.Receipts {
+		if receipt.Account == account && receipt.Job == job {
+			return nil
+		}
+	}
+	if len(l.state.Receipts) >= 10000 {
+		return fmt.Errorf("workbuddy: job receipt limit reached")
+	}
+	now := l.now()
+	next := now.Add(5 * time.Second)
+	var latest time.Time
+	for _, receipt := range l.state.Receipts {
+		if strings.HasPrefix(receipt.Job, "quota_scan:") && receipt.Status == "scheduled" && receipt.NextAttempt.After(latest) {
+			latest = receipt.NextAttempt
+		}
+	}
+	if spaced := latest.Add(15 * time.Second); spaced.After(next) {
+		next = spaced
+	}
+	if limit := now.Add(time.Hour); next.After(limit) {
+		next = limit
+	}
+	key := account + ":" + job + ":" + slot
+	l.state.Receipts[key] = JobReceipt{Account: account, Job: job, Slot: slot, Status: "scheduled", NextAttempt: next}
+	return l.persistLocked()
 }
 
 func RewardReceipt(result ControlResult) (JobReceipt, error) {
