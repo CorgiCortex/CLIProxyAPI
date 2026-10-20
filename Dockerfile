@@ -25,6 +25,7 @@ RUN mkdir /CLIProxyAPI
 COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+COPY internal/workbuddy/NOTICE /usr/share/doc/cliproxyapi/WORKBUDDY-NOTICE
 
 WORKDIR /CLIProxyAPI
 

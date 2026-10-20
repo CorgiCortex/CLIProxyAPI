@@ -21,6 +21,10 @@ type WorkBuddyRuntime struct {
 	Limiter    *workbuddy.Limiter
 	Policy     *workbuddy.PolicyState
 	Affinity   *workbuddy.Affinity
+	Jobs       *workbuddy.JobLedger
+	jobMu      sync.Mutex
+	jobCancel  context.CancelFunc
+	jobEpoch   uint64
 	// BaseURL is an injection seam for offline tests, never populated from auth files.
 	BaseURL     string
 	StateDir    string
@@ -38,6 +42,10 @@ func NewWorkBuddyRuntime(cfg config.WorkBuddyConfig) (*WorkBuddyRuntime, error) 
 	r := &WorkBuddyRuntime{Affinity: workbuddy.NewAffinity(nil), Policy: workbuddy.NewPolicyState(nil), Transports: workbuddy.NewTransports(256, nil), StateDir: filepath.Clean(cfg.StateDir), auths: make(map[string]*coreauth.Auth)}
 	var err error
 	r.Governor, err = workbuddy.OpenGovernor(filepath.Join(r.StateDir, "risk.json"), workbuddy.GovernorOptions{})
+	if err != nil {
+		return nil, err
+	}
+	r.Jobs, err = workbuddy.OpenJobLedger(filepath.Join(r.StateDir, "jobs.json"), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +87,7 @@ func (r *WorkBuddyRuntime) BindManager(manager *coreauth.Manager) {
 }
 
 func (r *WorkBuddyRuntime) Configure(cfg config.WorkBuddyConfig) error {
+	r.CancelMaintenance()
 	if filepath.Clean(cfg.StateDir) != r.StateDir {
 		return fmt.Errorf("workbuddy: changing state-dir requires a process restart")
 	}
@@ -109,6 +118,22 @@ func (r *WorkBuddyRuntime) Configure(cfg config.WorkBuddyConfig) error {
 		return err
 	}
 	return r.Limiter.Configure(cfg.MaxConcurrency, cfg.PerCallerConcurrency)
+}
+
+func (r *WorkBuddyRuntime) CancelMaintenance() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.jobEpoch++
+	if r.jobCancel != nil {
+		r.jobCancel()
+		r.jobCancel = nil
+	}
+}
+
+func (r *WorkBuddyRuntime) MaintenanceEpoch() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.jobEpoch
 }
 func WorkBuddyCredential(a *coreauth.Auth) (workbuddy.Credential, error) {
 	if a == nil || a.Provider != "workbuddy" {
@@ -175,6 +200,10 @@ func (r *WorkBuddyRuntime) Refresh(ctx context.Context, a *coreauth.Auth, proxy 
 	c, err := WorkBuddyCredential(a)
 	if err != nil {
 		return nil, err
+	}
+	gate, _ := r.Governor.Check(c, "credential_refresh", false, true)
+	if !gate.Allowed() && gate.Reason != "credential_expired" {
+		return nil, &workbuddy.DispatchError{Reason: gate.Reason, Status: 429, Stop: gate.Stop, Until: gate.Until}
 	}
 	client := &workbuddy.AuthClient{Transports: r.Transports, Versions: workbuddy.DefaultVersions(), ProxyURL: proxy, BaseURL: r.BaseURL}
 	var saved, loaded *coreauth.Auth

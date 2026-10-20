@@ -1,0 +1,65 @@
+name: WorkBuddy isolated image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'internal/workbuddy/**'
+      - 'internal/runtime/executor/workbuddy*'
+      - 'internal/runtime/executor/helps/workbuddy*'
+      - 'sdk/cliproxy/**'
+      - 'internal/config/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/workbuddy-image.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    if: github.repository == 'CorgiCortex/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify native WorkBuddy contracts
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go test -race -timeout 180s ./internal/workbuddy ./sdk/auth ./internal/watcher/synthesizer
+          go test -race -timeout 180s ./internal/runtime/executor ./internal/runtime/executor/helps ./sdk/cliproxy/auth ./sdk/cliproxy -run TestWorkBuddy
+          go build -o test-output ./cmd/server
+          rm test-output
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build immutable test-service image
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/corgicortex/cliproxyapi-wb:sha-${{ github.sha }}
+          build-args: |
+            VERSION=workbuddy-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=workbuddy
+          cache-to: type=gha,mode=max,scope=workbuddy
+      - name: Record image receipt
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          echo "Image: ghcr.io/corgicortex/cliproxyapi-wb:sha-${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: ${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment requires a separate GitOps image pin." >> "$GITHUB_STEP_SUMMARY"

@@ -322,3 +322,31 @@ func TestGovernorModelConfigurationFailuresDoNotPoisonAccount(t *testing.T) {
 		t.Fatalf("configuration failure poisoned account: %+v", gate)
 	}
 }
+
+func TestWorkBuddyObservedCreditChargesProtectReserveBetweenBalanceReads(t *testing.T) {
+	g, _, _ := governorFixture(t, Limits{ReserveCredits: 5})
+	c := testCredential()
+	_, balance := g.Check(c, "balance", false, true)
+	if err := g.ObserveBalance(c, balance, 20); err != nil {
+		t.Fatal(err)
+	}
+	_, attempt := g.Check(c, "paid", true, false)
+	_, staleBalance := g.Check(c, "balance", false, true)
+	credit := 16.0
+	if err := g.Complete(c, attempt, 1, &credit, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.ObserveBalance(c, staleBalance, 20); err != nil {
+		t.Fatal(err)
+	}
+	if gate, _ := g.Check(c, "paid", true, false); gate.Reason != "credit_reserve" {
+		t.Fatal("observed spend did not protect reserve")
+	}
+	_, fresh := g.Check(c, "balance", false, true)
+	if err := g.ObserveBalance(c, fresh, 30); err != nil {
+		t.Fatal(err)
+	}
+	if gate, _ := g.Check(c, "paid", true, false); !gate.Allowed() {
+		t.Fatal("fresh balance did not replace local debits")
+	}
+}

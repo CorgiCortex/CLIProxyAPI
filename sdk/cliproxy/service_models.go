@@ -9,10 +9,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/workbuddy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	log "github.com/sirupsen/logrus"
 )
 
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
@@ -206,7 +208,19 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 						models = append(models, &registry.ModelInfo{ID: id, Object: "model", OwnedBy: "workbuddy", Type: "workbuddy", UserDefined: true})
 					}
 				} else {
-					for _, model := range workbuddy.Catalog(credential.Realm) {
+					catalog := workbuddy.Catalog(credential.Realm)
+					if s.coreManager != nil {
+						if provider, ok := s.coreManager.Executor("workbuddy"); ok {
+							if native, okNative := provider.(*executor.WorkBuddyExecutor); okNative && native.UsesConfig(cfg) {
+								if observed, errCatalog := native.ModelCatalog(a); errCatalog == nil {
+									catalog = observed
+								} else {
+									log.WithField("provider", "workbuddy").Warn("cached model catalog unavailable; using static snapshot")
+								}
+							}
+						}
+					}
+					for _, model := range catalog {
 						if !model.Advertise {
 							continue
 						}

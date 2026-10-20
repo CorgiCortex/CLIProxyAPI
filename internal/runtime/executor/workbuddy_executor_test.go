@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -625,5 +627,147 @@ func TestWorkBuddyNativeSelectionUsesWarmHistoryAndRiskGates(t *testing.T) {
 	sibling, err := e.SelectAuth(ctx, "another-model", opts, []*coreauth.Auth{first})
 	if err != nil || sibling.ID != first.ID {
 		t.Fatal("model cooldown poisoned account")
+	}
+}
+
+func TestWorkBuddyMaintenanceDefaultsOffAndCachesDiscoveredModels(t *testing.T) {
+	var calls atomic.Int32
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v3/config" {
+			t.Error("unexpected background endpoint")
+		}
+		_, _ = io.WriteString(w, `{"code":0,"data":{"agents":{"cli":{"models":["fixture-discovered"]}},"models":[{"id":"fixture-discovered","maxInputTokens":2048}]}}`)
+	})
+	if _, err := e.RunMaintenance(context.Background()); err != nil || calls.Load() != 0 {
+		t.Fatal("disabled background jobs ran")
+	}
+	e.cfg.WorkBuddy.Jobs = config.WorkBuddyJobs{Enabled: true, ModelDiscovery: true}
+	changed, err := e.RunMaintenance(context.Background())
+	if err != nil || len(changed) != 1 || changed[0] != a.ID || calls.Load() != 1 {
+		t.Fatalf("changed=%v calls=%d err=%v", changed, calls.Load(), err)
+	}
+	if _, err = e.RunMaintenance(context.Background()); err != nil || calls.Load() != 1 {
+		t.Fatal("completed slot repeated")
+	}
+	restarted := NewWorkBuddyExecutor(e.cfg, nil)
+	restarted.runtime.BaseURL = e.runtime.BaseURL
+	restarted.TrackAuth(a)
+	t.Cleanup(restarted.runtime.Transports.CloseIdleConnections)
+	if _, err = restarted.RunMaintenance(context.Background()); err != nil || calls.Load() != 1 {
+		t.Fatal("restart repeated completed discovery")
+	}
+	models, err := restarted.ModelCatalog(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, model := range models {
+		if model.ID == "fixture-discovered" && model.Input == 2048 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("discovered catalog did not survive restart")
+	}
+}
+
+func TestWorkBuddyDisableReloadCancelsBackgroundConnection(t *testing.T) {
+	started := make(chan struct{})
+	e, _ := wbFixture(t, func(w http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done() })
+	e.cfg.WorkBuddy.Jobs = config.WorkBuddyJobs{Enabled: true, ModelDiscovery: true}
+	done := make(chan error, 1)
+	go func() { _, err := e.RunMaintenance(context.Background()); done <- err }()
+	<-started
+	nextCfg := *e.cfg
+	nextCfg.WorkBuddy.Enabled = false
+	disabled := NewWorkBuddyExecutor(&nextCfg, e)
+	if disabled.initErr == nil {
+		t.Fatal("disabled provider remained available")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("canceled background connection reported success")
+	}
+}
+
+func TestWorkBuddyUpstreamCreditUsageEnforcesPaidDailyBudget(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "aggregate", true: "stream"}[stream], func(t *testing.T) {
+			var calls atomic.Int32
+			e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.WriteString(w, strings.Replace(wbSuccess, `"total_tokens":10`, `"total_tokens":10,"credit":2.5`, 1))
+			})
+			e.cfg.WorkBuddy.Limits.DailyCredits = 2
+			if err := e.runtime.Configure(e.cfg.WorkBuddy); err != nil {
+				t.Fatal(err)
+			}
+			req, opts := wbRequest()
+			if stream {
+				opts.Stream = true
+				result, err := e.ExecuteStream(context.Background(), a, req, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+				}
+			} else if _, err := e.Execute(context.Background(), a, req, opts); err != nil {
+				t.Fatal(err)
+			}
+			_, err := e.Execute(context.Background(), a, req, opts)
+			if err == nil || !strings.Contains(err.Error(), "daily_credits") || calls.Load() != 1 {
+				t.Fatalf("calls=%d err=%v", calls.Load(), err)
+			}
+		})
+	}
+}
+
+func TestWorkBuddyResetProbeReusesGovernorAndStopsAfterObservedRecovery(t *testing.T) {
+	var calls atomic.Int32
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); _, _ = io.WriteString(w, wbSuccess) })
+	now := time.Now().Add(-2 * time.Minute)
+	governor, err := workbuddy.OpenGovernor(filepath.Join(t.TempDir(), "risk.json"), workbuddy.GovernorOptions{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.runtime.Governor = governor
+	e.cfg.WorkBuddy.Jobs = config.WorkBuddyJobs{Enabled: true, ResetProbes: true}
+	c, err := helps.WorkBuddyCredential(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = governor.RecordFailure(c, "hy3", workbuddy.Fault{Kind: workbuddy.FaultModelCap, ResetAt: now.Add(time.Minute)}, workbuddy.FailureOptions{FreeModel: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = e.RunMaintenance(context.Background()); err != nil || calls.Load() != 0 {
+		t.Fatal("probe ran before reset")
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err = e.RunMaintenance(context.Background()); err != nil || calls.Load() != 1 {
+		t.Fatalf("calls=%d err=%v", calls.Load(), err)
+	}
+	if len(governor.DueResetProbes(c)) != 0 {
+		t.Fatal("confirmed recovery retained pending reset")
+	}
+	if _, err = e.RunMaintenance(context.Background()); err != nil || calls.Load() != 1 {
+		t.Fatal("recovered model was probed again")
+	}
+}
+
+func TestWorkBuddyStaleExecutorCannotStartMaintenanceAfterDisable(t *testing.T) {
+	var calls atomic.Int32
+	e, _ := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"code":0,"data":{}}`)
+	})
+	e.cfg.WorkBuddy.Jobs = config.WorkBuddyJobs{Enabled: true, ModelDiscovery: true}
+	disabledConfig := *e.cfg
+	disabledConfig.WorkBuddy.Enabled = false
+	_ = NewWorkBuddyExecutor(&disabledConfig, e)
+	if changed, err := e.RunMaintenance(context.Background()); err != nil || len(changed) != 0 || calls.Load() != 0 {
+		t.Fatal("old executor started maintenance after disable")
 	}
 }

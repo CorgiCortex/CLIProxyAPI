@@ -52,6 +52,7 @@ type accountRisk struct {
 	CreditsSpent     float64               `json:"credits_spent"`
 	ModelTokens      map[string]int64      `json:"model_tokens"`
 	CreditsRemain    *float64              `json:"credits_remain,omitempty"`
+	CreditsDebited   float64               `json:"credits_debited,omitempty"`
 	BalanceStartedAt time.Time             `json:"balance_started_at,omitempty"`
 }
 
@@ -148,7 +149,7 @@ func OpenGovernor(path string, options GovernorOptions) (*Governor, error) {
 			if state == nil || state.Models == nil || state.ModelTokens == nil {
 				return nil, fmt.Errorf("workbuddy: incomplete account risk state")
 			}
-			if state.Tokens < 0 || !validCredit(state.CreditsSpent) || (state.CreditsRemain != nil && !validCredit(*state.CreditsRemain)) {
+			if state.Tokens < 0 || !validCredit(state.CreditsSpent) || !validCredit(state.CreditsDebited) || (state.CreditsRemain != nil && !validCredit(*state.CreditsRemain)) {
 				return nil, fmt.Errorf("workbuddy: invalid persisted usage")
 			}
 			for _, tokens := range state.ModelTokens {
@@ -246,10 +247,6 @@ func (g *Governor) Check(c Credential, model string, paid, balanceOnly bool) (Ga
 		gate.Reason = "credential_disabled"
 		return gate, attempt
 	}
-	if c.ExpiresAt > 0 && c.ExpiresAt <= now.Unix() {
-		gate.Reason = "credential_expired"
-		return gate, attempt
-	}
 	if region := g.state.Realms[c.Realm]; region != nil && now.Before(region.HoldUntil) {
 		gate.Reason, gate.Until, gate.Stop = "region_restricted", region.HoldUntil, true
 		return gate, attempt
@@ -279,6 +276,10 @@ func (g *Governor) Check(c Credential, model string, paid, balanceOnly bool) (Ga
 			return gate, attempt
 		}
 	}
+	if c.ExpiresAt > 0 && c.ExpiresAt <= now.Unix() {
+		gate.Reason = "credential_expired"
+		return gate, attempt
+	}
 	if balanceOnly {
 		return gate, attempt
 	}
@@ -291,7 +292,7 @@ func (g *Governor) Check(c Credential, model string, paid, balanceOnly bool) (Ga
 			gate.Reason = "balance_unknown"
 			return gate, attempt
 		}
-		if *state.CreditsRemain <= limits.ReserveCredits {
+		if *state.CreditsRemain-state.CreditsDebited <= limits.ReserveCredits {
 			gate.Reason = "credit_reserve"
 			return gate, attempt
 		}
@@ -469,13 +470,14 @@ func (g *Governor) Complete(c Credential, attempt Attempt, tokens int64, credits
 	}
 	state := g.accountLocked(c)
 	if tokens > math.MaxInt64-state.Tokens || tokens > math.MaxInt64-state.ModelTokens[attempt.Model] ||
-		(credits != nil && !validCredit(state.CreditsSpent+*credits)) {
+		(credits != nil && (!validCredit(state.CreditsSpent+*credits) || !validCredit(state.CreditsDebited+*credits))) {
 		return fmt.Errorf("workbuddy: usage counter overflow")
 	}
 	state.Tokens += tokens
 	state.ModelTokens[attempt.Model] += tokens
 	if credits != nil {
 		state.CreditsSpent += *credits
+		state.CreditsDebited += *credits
 	}
 	if success {
 		if mark, ok := g.state.Entitlements[c.Realm][attempt.Model]; ok && !attempt.StartedAt.Before(mark.CheckedAt) {
@@ -488,7 +490,14 @@ func (g *Governor) Complete(c Credential, attempt Attempt, tokens int64, credits
 		state.Failures, state.UnknownFailures, state.SoftStreak, state.UnscopedStreak = 0, 0, 0, 0
 		if model := state.Models[attempt.Model]; model != nil {
 			model.CooldownUntil = time.Time{}
+			if !g.options.Now().Before(model.CapUntil) {
+				model.CapUntil = time.Time{}
+			}
 		}
+		state.Version++
+	} else if credits != nil && *credits > 0 {
+		// An older balance request must not overwrite a subsequently observed
+		// charge, including one from a truncated response.
 		state.Version++
 	}
 	return g.persistLocked()
@@ -505,10 +514,29 @@ func (g *Governor) ObserveBalance(c Credential, attempt Attempt, remain float64)
 		return nil
 	}
 	state.CreditsRemain = &remain
+	state.CreditsDebited = 0
 	state.BalanceStartedAt = attempt.StartedAt
 	if remain > 0 && attempt.Version == state.Version {
 		state.BalanceUntil = time.Time{}
 	}
+	return g.persistLocked()
+}
+
+// ForgetBalance records an incomplete observation without carrying a previous
+// balance forward. It does not clear credit parking or any risk restriction.
+func (g *Governor) ForgetBalance(c Credential, attempt Attempt) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if attempt.Account != RiskAccountKey(c) {
+		return fmt.Errorf("workbuddy: invalid balance observation")
+	}
+	state := g.accountLocked(c)
+	if attempt.Version != state.Version || attempt.StartedAt.Before(state.BalanceStartedAt) {
+		return nil
+	}
+	state.CreditsRemain = nil
+	state.CreditsDebited = 0
+	state.BalanceStartedAt = attempt.StartedAt
 	return g.persistLocked()
 }
 

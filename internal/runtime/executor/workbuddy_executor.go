@@ -29,9 +29,10 @@ var _ coreauth.RequestAuthPreparer = (*WorkBuddyExecutor)(nil)
 // WorkBuddyExecutor owns no account-specific transport or risk state. Those
 // belong to the shared runtime so rotations and reloads cannot bypass gates.
 type WorkBuddyExecutor struct {
-	cfg     *config.Config
-	runtime *helps.WorkBuddyRuntime
-	initErr error
+	cfg          *config.Config
+	runtime      *helps.WorkBuddyRuntime
+	initErr      error
+	runtimeEpoch uint64
 }
 
 func NewWorkBuddyExecutor(cfg *config.Config, previous *WorkBuddyExecutor) *WorkBuddyExecutor {
@@ -40,6 +41,9 @@ func NewWorkBuddyExecutor(cfg *config.Config, previous *WorkBuddyExecutor) *Work
 		e.runtime = previous.runtime
 	}
 	if cfg == nil || !cfg.WorkBuddy.Enabled {
+		if e.runtime != nil {
+			e.runtime.CancelMaintenance()
+		}
 		e.initErr = fmt.Errorf("workbuddy: provider is disabled")
 		return e
 	}
@@ -47,6 +51,9 @@ func NewWorkBuddyExecutor(cfg *config.Config, previous *WorkBuddyExecutor) *Work
 		e.runtime, e.initErr = helps.NewWorkBuddyRuntime(cfg.WorkBuddy)
 	} else {
 		e.initErr = e.runtime.Configure(cfg.WorkBuddy)
+	}
+	if e.runtime != nil {
+		e.runtimeEpoch = e.runtime.MaintenanceEpoch()
 	}
 	return e
 }
@@ -61,6 +68,44 @@ func (e *WorkBuddyExecutor) TrackAuth(a *coreauth.Auth) {
 	if e.runtime != nil {
 		e.runtime.Track(a)
 	}
+}
+
+func (e *WorkBuddyExecutor) ModelCatalog(a *coreauth.Auth) ([]workbuddy.Model, error) {
+	if e.initErr != nil {
+		return nil, e.initErr
+	}
+	c, err := helps.WorkBuddyCredential(a)
+	if err != nil {
+		return nil, err
+	}
+	return e.runtime.Models(c)
+}
+
+func (e *WorkBuddyExecutor) RunMaintenance(ctx context.Context) ([]string, error) {
+	if e.initErr != nil {
+		return nil, e.initErr
+	}
+	return e.runtime.Maintenance(ctx, e.cfg, e.runtimeEpoch, func(ctx context.Context, auth *coreauth.Auth, model string) error {
+		probeExecutor := *e
+		probeConfig := *e.cfg
+		probeConfig.WorkBuddy.PaidFallback = false
+		probeConfig.WorkBuddy.AutoSwitchProduct = false
+		probeConfig.WorkBuddy.Prompt = config.WorkBuddyPrompt{Mode: "custom", Text: workbuddy.DegradedPrompt}
+		probeExecutor.cfg = &probeConfig
+		payload, err := json.Marshal(map[string]any{
+			"model":      model,
+			"messages":   []map[string]string{{"role": "user", "content": "Reply with OK."}},
+			"max_tokens": 16,
+		})
+		if err != nil {
+			return err
+		}
+		opts := execution.Options{SourceFormat: sdktranslator.FromString("openai"), Metadata: map[string]any{
+			execution.ExecutionSessionMetadataKey: "workbuddy-quota-probe:" + model,
+		}}
+		_, err = probeExecutor.Execute(ctx, auth, execution.Request{Model: model, Payload: payload}, opts)
+		return err
+	})
 }
 func (e *WorkBuddyExecutor) PrepareExecutionContext(ctx context.Context, req execution.Request, opts execution.Options) (context.Context, error) {
 	if e.initErr != nil {
@@ -325,6 +370,7 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		emitted := false
 		var usage json.RawMessage
 		var tokens int64
+		var credits *float64
 		finished := make(map[int]bool)
 		errStream := workbuddy.ReadEvents(response.Body, func(raw []byte) error {
 			event, errEvent := workbuddy.DecodeEvent(raw)
@@ -335,6 +381,9 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 				usage = append(usage[:0], event.Usage...)
 				if observed, ok := workbuddy.ObservedTokens(usage); ok {
 					tokens = observed
+				}
+				if observed := workbuddy.ObservedCredits(usage); observed != nil {
+					credits = observed
 				}
 			}
 			reporter.ObserveResponseModel(raw)
@@ -367,7 +416,7 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		if len(usage) > 0 {
 			reportedUsage = usage
 		}
-		if errComplete := e.runtime.Governor.Complete(c, attempt, tokens, nil, errStream == nil); errComplete != nil {
+		if errComplete := e.runtime.Governor.Complete(c, attempt, tokens, credits, errStream == nil); errComplete != nil {
 			return &workbuddy.DispatchError{Reason: "usage_persistence_failed", Status: 503, Stop: true}
 		}
 		if errStream == nil {

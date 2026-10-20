@@ -178,6 +178,18 @@ func ObservedTokens(raw json.RawMessage) (int64, bool) {
 	return 0, false
 }
 
+func ObservedCredits(raw json.RawMessage) *float64 {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return nil
+	}
+	value, err := observedNumber(fields, "credit")
+	if err != nil {
+		return nil
+	}
+	return value
+}
+
 type collectedTool struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`

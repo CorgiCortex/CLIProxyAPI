@@ -55,9 +55,12 @@ HTTP errors and error envelopes inside HTTP 200 streams share the risk classifie
 A truncated stream is an error; once a chunk was emitted it cannot be replayed
 on another credential. Only a pre-output connection failure gets one retry.
 
-The static model catalog is an offline snapshot. It is not evidence of live
-model availability. Native credential `models` can explicitly restrict the
-published models, including synthetic models used by offline tests.
+The static model catalog is an offline snapshot. Opt-in discovery reads
+`/v3/config`, prefers the CLI agent's model list and merges observed metadata
+with the snapshot. Empty responses cannot erase the catalog. Discovery persists
+per-account results and republishes model registrations with the existing SDK
+publication fences. Neither source establishes entitlement to run a model.
+Native credential `models` explicitly restrict the published models.
 
 The governor and transport pools are shared across executor replacements.
 Configuration reloads preserve cooldowns, restrictions and usage. Changing the
@@ -87,9 +90,34 @@ fallback applies only to international DeepSeek Flash when every enabled account
 in that region has an active free-model cap; paid budgets are checked again.
 All rebuilt requests pass through the final payload-rule barrier exactly once.
 
-The remaining stage-2 work is live model discovery. Stage-3 quota and activity
-jobs are not implemented or enabled yet. These gaps must be closed before
-claiming parity with the reference project's risk controls.
+Background operations now share chat's governor, connection pools and limiter:
+
+- Model discovery and balance observations run in six-hour slots. Resource
+  pagination must complete before publishing totals. Missing numeric fields
+  remain unknown, including the enterprise endpoint's unreported remainder.
+- CN personal sign-in runs after 09:00 CST. An explicit already-checked-in
+  response is completion evidence, with no invented reward amount.
+- Growth reconciliation runs after 09:00 and 21:00 CST. It verifies individual
+  acceptance results and claims only vendor-observed completion. Desktop,
+  subscription, donation and other real actions are not fabricated as telemetry.
+- Optional quota scans use the three known free-cap models as applicable to the
+  realm. Reset probes wait for the recorded reset time; both execute through the
+  native chat path with paid fallback and product switching disabled. Each cycle
+  admits at most 16 probes, with 400 ms spacing.
+- Atomic job receipts precede actions. Completed slots survive restart; ordinary
+  failures retry after 15 minutes, at most six times per slot. Reset failures
+  retry after at least 15 seconds, at most 20 times per reset window, subject to
+  any longer governor cooldown. Reload and shutdown cancel active maintenance.
+
+Background jobs default to disabled. They record only observed credits and
+rewards. Inference `usage.credit` feeds the paid daily budget and local debits
+against the last observed balance, protecting the reserve between refreshes.
+The persisted balance snapshot retains the vendor's original observation.
+
+Automated international web activity and actual task-specific growth actions
+remain follow-up work. The isolated deployment and real-account validation are
+still pending; this implementation must not be described as fully validated
+upstream parity.
 
 An explicit v8 configuration enables the provider:
 
@@ -103,6 +131,14 @@ oauth:
       max-concurrency: 32
       per-caller-concurrency: 2
       queue-seconds: 30
+      jobs:
+        enabled: false
+        model-discovery: false
+        balance-refresh: false
+        checkin: false
+        growth: false
+        quota-scan: false
+        reset-probes: false
       limits:
         daily-tokens: 0
         daily-credits: 0
@@ -117,6 +153,11 @@ token counts. Concurrent requests can complete beyond a configured budget.
 Queue deadlines end at admission and never become upstream network deadlines.
 The general management HTTP tunnel is unsupported for this provider; arbitrary
 requests must not bypass its risk governor or export credentials to another host.
+
+The `WorkBuddy isolated image` workflow publishes only
+`ghcr.io/corgicortex/cliproxyapi-wb:sha-<full-commit>` after offline race checks.
+It never updates the existing DockerHub image or deploys a workload. Deployment
+requires a separately reviewed GitOps pin.
 
 ## Credential setup
 

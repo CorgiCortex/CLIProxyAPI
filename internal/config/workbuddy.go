@@ -3,6 +3,7 @@ package config
 // WorkBuddyConfig is opt-in. State belongs to a dedicated provider volume and
 // must never be shared between independent server processes.
 type WorkBuddyConfig struct {
+	Jobs                 WorkBuddyJobs              `yaml:"jobs" json:"jobs"`
 	AffinityByPrefix     *bool                      `yaml:"affinity-by-prefix" json:"affinity-by-prefix"`
 	AffinityMaxMessages  *int                       `yaml:"affinity-max-messages" json:"affinity-max-messages"`
 	AffinityPageSize     *int                       `yaml:"affinity-page-size" json:"affinity-page-size"`
@@ -18,6 +19,16 @@ type WorkBuddyConfig struct {
 	QueueSeconds         int                        `yaml:"queue-seconds" json:"queue-seconds"`
 	Limits               WorkBuddyLimits            `yaml:"limits" json:"limits"`
 	RealmLimits          map[string]WorkBuddyLimits `yaml:"realm-limits" json:"realm-limits"`
+}
+
+type WorkBuddyJobs struct {
+	Enabled        bool `yaml:"enabled" json:"enabled"`
+	ModelDiscovery bool `yaml:"model-discovery" json:"model-discovery"`
+	BalanceRefresh bool `yaml:"balance-refresh" json:"balance-refresh"`
+	Checkin        bool `yaml:"checkin" json:"checkin"`
+	Growth         bool `yaml:"growth" json:"growth"`
+	QuotaScan      bool `yaml:"quota-scan" json:"quota-scan"`
+	ResetProbes    bool `yaml:"reset-probes" json:"reset-probes"`
 }
 
 type WorkBuddyLimits struct {
