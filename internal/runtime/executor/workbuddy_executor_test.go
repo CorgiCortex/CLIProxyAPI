@@ -728,6 +728,8 @@ func TestWorkBuddyUpstreamCreditUsageEnforcesPaidDailyBudget(t *testing.T) {
 func TestWorkBuddyResetProbeReusesGovernorAndStopsAfterObservedRecovery(t *testing.T) {
 	var calls atomic.Int32
 	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); _, _ = io.WriteString(w, wbSuccess) })
+	a.Metadata["models"] = []string{"hy3"}
+	e.TrackAuth(a)
 	now := time.Now().Add(-2 * time.Minute)
 	governor, err := workbuddy.OpenGovernor(filepath.Join(t.TempDir(), "risk.json"), workbuddy.GovernorOptions{Now: func() time.Time { return now }})
 	if err != nil {
@@ -769,5 +771,49 @@ func TestWorkBuddyStaleExecutorCannotStartMaintenanceAfterDisable(t *testing.T) 
 	_ = NewWorkBuddyExecutor(&disabledConfig, e)
 	if changed, err := e.RunMaintenance(context.Background()); err != nil || len(changed) != 0 || calls.Load() != 0 {
 		t.Fatal("old executor started maintenance after disable")
+	}
+}
+
+func TestWorkBuddyResetProbeRespectsCredentialAndPublishedModelRestrictions(t *testing.T) {
+	for _, withManager := range []bool{false, true} {
+		t.Run(map[bool]string{false: "credential-models", true: "published-models"}[withManager], func(t *testing.T) {
+			var calls atomic.Int32
+			e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); _, _ = io.WriteString(w, wbSuccess) })
+			if withManager {
+				a.Metadata["models"] = []string{"hy3"}
+				store := sdkauth.NewFileTokenStore()
+				store.SetBaseDir(t.TempDir())
+				manager := coreauth.NewManager(store, nil, nil)
+				registered, err := manager.Register(context.Background(), a)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.BindCredentialManager(manager)
+				e.TrackAuth(registered)
+				a = registered
+				// No hy3 publication: a model excluded by SDK policy must stay unprobed.
+			}
+			now := time.Now().Add(-2 * time.Minute)
+			governor, err := workbuddy.OpenGovernor(filepath.Join(t.TempDir(), "risk.json"), workbuddy.GovernorOptions{Now: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.runtime.Governor = governor
+			e.cfg.WorkBuddy.Jobs = config.WorkBuddyJobs{Enabled: true, ResetProbes: true}
+			c, err := helps.WorkBuddyCredential(a)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = governor.RecordFailure(c, "hy3", workbuddy.Fault{Kind: workbuddy.FaultModelCap, ResetAt: now.Add(time.Minute)}, workbuddy.FailureOptions{FreeModel: true}); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(2 * time.Minute)
+			if _, err = e.RunMaintenance(context.Background()); err != nil || calls.Load() != 0 {
+				t.Fatalf("excluded model was probed: calls=%d err=%v", calls.Load(), err)
+			}
+			if len(governor.DueResetProbes(c)) != 1 {
+				t.Fatal("excluded probe falsely recorded recovery")
+			}
+		})
 	}
 }

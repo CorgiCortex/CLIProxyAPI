@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/workbuddy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -172,6 +174,17 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 			}
 		}
 		if len(probe) > 0 && (policy.QuotaScan || policy.ResetProbes) {
+			allowed := func(a *coreauth.Auth, model string) bool {
+				credential, errCredential := WorkBuddyCredential(a)
+				if errCredential != nil || credential.Disabled || len(credential.Models) > 0 && !slices.Contains(credential.Models, model) {
+					return false
+				}
+				if manager == nil {
+					return true
+				}
+				models := registry.GetGlobalRegistry()
+				return models.ClientSupportsModel(a.ID, model) || a.Prefix != "" && models.ClientSupportsModel(a.ID, a.Prefix+"/"+model)
+			}
 			plans := r.Governor.DueResetProbes(c)
 			pendingReset := make(map[string]bool, len(plans))
 			for _, plan := range plans {
@@ -188,6 +201,9 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 				}
 			}
 			for _, plan := range plans {
+				if !allowed(r.Current(auth), plan.Model) {
+					continue
+				}
 				if probeCount >= 16 {
 					return changed, errors.Join(failures...)
 				}
@@ -206,6 +222,10 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 					if _, errLoad := load(); errLoad != nil {
 						return workbuddy.JobReceipt{}, errLoad
 					}
+					current := r.Current(auth)
+					if !allowed(current, plan.Model) {
+						return workbuddy.JobReceipt{}, &workbuddy.DispatchError{Reason: "model_not_allowed_for_probe", Status: 400, Stop: true}
+					}
 					if probeCount > 0 {
 						timer := time.NewTimer(400 * time.Millisecond)
 						select {
@@ -219,7 +239,11 @@ func (r *WorkBuddyRuntime) Maintenance(ctx context.Context, cfg *config.Config, 
 					if plan.ResetAt.IsZero() {
 						scanCount++
 					}
-					return workbuddy.JobReceipt{}, probe[0](ctx, r.Current(auth), plan.Model)
+					current = r.Current(auth)
+					if !allowed(current, plan.Model) {
+						return workbuddy.JobReceipt{}, &workbuddy.DispatchError{Reason: "model_not_allowed_for_probe", Status: 400, Stop: true}
+					}
+					return workbuddy.JobReceipt{}, probe[0](ctx, current, plan.Model)
 				})
 				if errProbe != nil {
 					failures = append(failures, fmt.Errorf("workbuddy: quota probe: %w", errProbe))
