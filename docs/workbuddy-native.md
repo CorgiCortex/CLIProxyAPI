@@ -65,9 +65,15 @@ state directory requires a restart; the old directory must be migrated explicitl
 Only one process may own a state directory. The isolated deployment will use a
 single replica and its own PVC.
 
+Model entitlement error `11158` is retained as region/model evidence for 24 hours,
+including the reported user tier when known. As in the reference, this is not a
+blanket dispatch ban: a free account's refusal cannot establish whether a paid
+account may use the model. A later successful check clears the mark; older
+in-flight completions cannot erase newer evidence. Model configuration errors
+`11129` and `11150` also stop rotation without penalizing the account.
+
 The remaining stage-2 work includes live model discovery, conversation paging,
-affinity policy, content-rejection degradation, region/model entitlement holds,
-optional exit backoff, identity switching and paid fallback. Stage-3 quota and
+affinity policy, content-rejection degradation, optional exit backoff, identity switching and paid fallback. Stage-3 quota and
 activity jobs are not implemented or enabled yet. These gaps must be closed
 before claiming parity with the reference project's risk controls.
 

@@ -60,10 +60,20 @@ type realmRisk struct {
 	Events    map[string]time.Time `json:"events"`
 }
 
+// EntitlementMark records a refusal observed for a region/model and reported
+// user tier. It is evidence, not a region-wide permission decision: one free
+// account's refusal must not block paid accounts in the same region.
+type EntitlementMark struct {
+	CheckedAt time.Time `json:"checked_at"`
+	Until     time.Time `json:"until"`
+	UserType  string    `json:"user_type,omitempty"`
+}
+
 type governorState struct {
-	Version  int                     `json:"version"`
-	Accounts map[string]*accountRisk `json:"accounts"`
-	Realms   map[Realm]*realmRisk    `json:"realms"`
+	Version      int                                  `json:"version"`
+	Entitlements map[Realm]map[string]EntitlementMark `json:"entitlements,omitempty"`
+	Accounts     map[string]*accountRisk              `json:"accounts"`
+	Realms       map[Realm]*realmRisk                 `json:"realms"`
 }
 
 type Governor struct {
@@ -159,6 +169,19 @@ func OpenGovernor(path string, options GovernorOptions) (*Governor, error) {
 		}
 	} else if !errors.Is(errRead, os.ErrNotExist) {
 		return nil, fmt.Errorf("workbuddy: read risk state: %w", errRead)
+	}
+	if g.state.Entitlements == nil {
+		g.state.Entitlements = make(map[Realm]map[string]EntitlementMark)
+	}
+	for realm, models := range g.state.Entitlements {
+		if realm != China && realm != International {
+			return nil, fmt.Errorf("workbuddy: invalid entitlement region")
+		}
+		for model, mark := range models {
+			if model == "" || mark.CheckedAt.IsZero() || mark.Until.Before(mark.CheckedAt) {
+				return nil, fmt.Errorf("workbuddy: invalid entitlement evidence")
+			}
+		}
 	}
 	if err := g.persistLocked(); err != nil {
 		return nil, err
@@ -398,6 +421,14 @@ func (g *Governor) RecordFailure(c Credential, model string, fault Fault, option
 			state.CooldownUntil = later(state.CooldownUntil, now.Add(wait))
 			gate.Until = later(gate.Until, state.CooldownUntil)
 		}
+	case FaultEntitlement:
+		models := g.state.Entitlements[c.Realm]
+		if models == nil {
+			models = make(map[string]EntitlementMark)
+			g.state.Entitlements[c.Realm] = models
+		}
+		models[model] = EntitlementMark{CheckedAt: now, Until: now.Add(24 * time.Hour), UserType: fault.UserType}
+		gate.Stop = true
 	case FaultAuth:
 		// Called only after the request's one refresh attempt has failed.
 		wait := time.Minute
@@ -445,6 +476,11 @@ func (g *Governor) Complete(c Credential, attempt Attempt, tokens int64, credits
 	state.ModelTokens[attempt.Model] += tokens
 	if credits != nil {
 		state.CreditsSpent += *credits
+	}
+	if success {
+		if mark, ok := g.state.Entitlements[c.Realm][attempt.Model]; ok && !attempt.StartedAt.Before(mark.CheckedAt) {
+			delete(g.state.Entitlements[c.Realm], attempt.Model)
+		}
 	}
 	if success && attempt.Version == state.Version {
 		state.RestrictedUntil, state.CooldownUntil, state.BreakerUntil, state.DegradeUntil = time.Time{}, time.Time{}, time.Time{}, time.Time{}
@@ -516,4 +552,12 @@ func (g *Governor) UpdateLimits(limits Limits, realms map[Realm]Limits) error {
 	g.options.Limits = clone(limits)
 	g.options.Realms = copyRealms
 	return nil
+}
+
+// Entitlement returns fresh refusal evidence without changing dispatch policy.
+func (g *Governor) Entitlement(realm Realm, model string) (EntitlementMark, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	mark, ok := g.state.Entitlements[realm][model]
+	return mark, ok && g.options.Now().Before(mark.Until)
 }

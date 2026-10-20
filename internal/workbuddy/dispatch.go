@@ -24,6 +24,17 @@ func (e *DispatchError) StatusCode() int {
 	}
 	return http.StatusServiceUnavailable
 }
+func (e *DispatchError) RetryAfter() *time.Duration {
+	if e.Until.IsZero() {
+		return nil
+	}
+	wait := time.Until(e.Until)
+	if wait < 0 {
+		wait = 0
+	}
+	return &wait
+}
+
 func (e *DispatchError) NativeExecutionErrorAction() string {
 	if e.Stop {
 		return "stop"
@@ -34,7 +45,7 @@ func (e *DispatchError) NativeExecutionErrorAction() string {
 func ErrorForFault(f Fault) *DispatchError {
 	stop := false
 	switch f.Kind {
-	case FaultRestricted, FaultContent, FaultModelRetired, FaultProviderUnavailable, FaultEntitlement, FaultTLS, FaultCanceled, FaultRequest:
+	case FaultRestricted, FaultContent, FaultModelRetired, FaultProviderUnavailable, FaultEntitlement, FaultModelParameter, FaultTLS, FaultCanceled, FaultRequest:
 		stop = true
 	}
 	status := f.Status

@@ -28,6 +28,7 @@ const (
 	FaultModelRetired        FaultKind = "model_retired"
 	FaultProviderUnavailable FaultKind = "provider_unavailable"
 	FaultEntitlement         FaultKind = "model_entitlement"
+	FaultModelParameter      FaultKind = "model_parameter"
 	FaultGateway             FaultKind = "gateway"
 	FaultHard                FaultKind = "hard_failure"
 	FaultUnknown             FaultKind = "unknown_failure"
@@ -41,11 +42,12 @@ const (
 // Fault contains only classification evidence. Upstream bodies can contain
 // credentials or user content and must not enter persisted risk state.
 type Fault struct {
-	Kind    FaultKind
-	Status  int
-	Code    int
-	ResetAt time.Time
-	Soft    bool
+	Kind     FaultKind
+	Status   int
+	Code     int
+	ResetAt  time.Time
+	Soft     bool
+	UserType string
 }
 
 var (
@@ -167,8 +169,12 @@ func ClassifyHTTP(status int, raw []byte) Fault {
 			case 11134:
 				fault.Kind = FaultProviderUnavailable
 				return fault
+			case 11129, 11150:
+				fault.Kind = FaultModelParameter
+				return fault
 			case 11158:
 				fault.Kind = FaultEntitlement
+				fault.UserType = entitlementUserType(raw)
 				return fault
 			}
 		}
@@ -204,4 +210,15 @@ func ClassifyTransport(err error) Fault {
 		return Fault{Kind: FaultConnection}
 	}
 	return Fault{Kind: FaultUnknown}
+}
+
+// entitlementUserType retains only known tier labels, never arbitrary messages.
+func entitlementUserType(raw []byte) string {
+	text := faultText(raw)
+	for _, tier := range []string{"personal_free_user", "personal_paid_user", "enterprise_user"} {
+		if strings.Contains(text, tier) {
+			return tier
+		}
+	}
+	return ""
 }

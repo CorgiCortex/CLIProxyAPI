@@ -343,12 +343,16 @@ func (e *WorkBuddyExecutor) recordFailure(c workbuddy.Credential, model string, 
 	if fault.Kind == workbuddy.FaultHard || fault.Kind == workbuddy.FaultUnknown {
 		charge = state.Charge(c)
 	}
+	failure := workbuddy.ErrorForFault(fault)
 	if charge {
-		if _, err := e.runtime.Governor.RecordFailure(c, model, fault, workbuddy.FailureOptions{FreeModel: workbuddy.IsFreeCapModel(c.Realm, model), SingleAccount: e.runtime.Accounts() <= 1}); err != nil {
+		gate, err := e.runtime.Governor.RecordFailure(c, model, fault, workbuddy.FailureOptions{FreeModel: workbuddy.IsFreeCapModel(c.Realm, model), SingleAccount: e.runtime.Accounts() <= 1})
+		if err != nil {
 			return &workbuddy.DispatchError{Reason: "risk_persistence_failed", Status: 503, Stop: true}
 		}
+		failure.Until = gate.Until
+		failure.Stop = failure.Stop || gate.Stop
 	}
-	return workbuddy.ErrorForFault(fault)
+	return failure
 }
 func closeWorkBuddyBody(body io.Closer) {
 	if err := body.Close(); err != nil {

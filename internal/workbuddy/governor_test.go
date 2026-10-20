@@ -242,3 +242,69 @@ func TestGovernorInvalidStateAndPersistenceFailureStopDispatch(t *testing.T) {
 		t.Fatal("unknown risk schema accepted")
 	}
 }
+
+func TestGovernorEntitlementEvidenceIsScopedAndExpires(t *testing.T) {
+	g, now, path := governorFixture(t, Limits{})
+	free := testCredential()
+	paid := free
+	paid.UID = "paid-fixture-user"
+	paid.EnterpriseID = "fixture-enterprise"
+	_, older := g.Check(paid, "model", true, false)
+	*now = now.Add(time.Second)
+	fault := ClassifyHTTP(500, []byte(`{"code":11158,"message":"model is not allowed for user type [personal_free_user]"}`))
+	if gate, err := g.RecordFailure(free, "model", fault, FailureOptions{}); err != nil || !gate.Stop {
+		t.Fatalf("record: %+v %v", gate, err)
+	}
+	restarted, err := OpenGovernor(path, g.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark, ok := restarted.Entitlement(International, "model")
+	if !ok || mark.UserType != "personal_free_user" {
+		t.Fatalf("mark = %+v %v", mark, ok)
+	}
+	if gate, _ := restarted.Check(paid, "model", true, false); !gate.Allowed() {
+		t.Fatal("free refusal blocked paid account")
+	}
+	if gate, _ := restarted.Check(free, "sibling", true, false); !gate.Allowed() {
+		t.Fatal("model refusal penalized sibling model")
+	}
+	if err := restarted.Complete(paid, older, 0, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.Entitlement(International, "model"); !ok {
+		t.Fatal("stale completion erased newer refusal evidence")
+	}
+	_, fresh := restarted.Check(paid, "model", true, false)
+	if err := restarted.Complete(paid, fresh, 0, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.Entitlement(International, "model"); ok {
+		t.Fatal("successful recheck did not clear mark")
+	}
+	if _, err := restarted.RecordFailure(free, "model", fault, FailureOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(24 * time.Hour)
+	if _, ok := restarted.Entitlement(International, "model"); ok {
+		t.Fatal("entitlement mark did not expire")
+	}
+}
+func TestGovernorModelConfigurationFailuresDoNotPoisonAccount(t *testing.T) {
+	g, _, _ := governorFixture(t, Limits{})
+	c := testCredential()
+	for _, code := range []string{"11129", "11150"} {
+		fault := ClassifyHTTP(550, []byte(`{"code":`+code+`}`))
+		if fault.Kind != FaultModelParameter || !ErrorForFault(fault).Stop {
+			t.Fatalf("code %s classified %+v", code, fault)
+		}
+		for i := 0; i < 8; i++ {
+			if _, err := g.RecordFailure(c, "model", fault, FailureOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if gate, _ := g.Check(c, "sibling", true, false); !gate.Allowed() {
+		t.Fatalf("configuration failure poisoned account: %+v", gate)
+	}
+}
