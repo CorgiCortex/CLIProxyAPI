@@ -479,3 +479,41 @@ func (g *Governor) ObserveBalance(c Credential, attempt Attempt, remain float64)
 func validCredit(value float64) bool {
 	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
+
+// UpdateLimits applies hot-reloaded budgets without rebuilding cooldown state.
+func (g *Governor) UpdateLimits(limits Limits, realms map[Realm]Limits) error {
+	validate := func(l Limits) bool {
+		if !validCredit(l.ReserveCredits) || !validCredit(l.DailyCredits) || l.DailyTokens < 0 {
+			return false
+		}
+		for _, n := range l.ModelTokens {
+			if n < 0 {
+				return false
+			}
+		}
+		return true
+	}
+	clone := func(l Limits) Limits {
+		m := make(map[string]int64, len(l.ModelTokens))
+		for k, v := range l.ModelTokens {
+			m[k] = v
+		}
+		l.ModelTokens = m
+		return l
+	}
+	if !validate(limits) {
+		return fmt.Errorf("workbuddy: invalid budgets")
+	}
+	copyRealms := make(map[Realm]Limits, len(realms))
+	for realm, l := range realms {
+		if (realm != International && realm != China) || !validate(l) {
+			return fmt.Errorf("workbuddy: invalid regional budgets")
+		}
+		copyRealms[realm] = clone(l)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.options.Limits = clone(limits)
+	g.options.Realms = copyRealms
+	return nil
+}

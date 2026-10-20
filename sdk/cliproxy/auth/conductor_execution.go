@@ -131,6 +131,12 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
 
+	var errPrepare error
+	ctx, errPrepare = m.prepareExecutionContext(ctx, normalized, req, opts)
+	if errPrepare != nil {
+		return cliproxyexecutor.Response{}, errPrepare
+	}
+
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
@@ -243,6 +249,12 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+
+	var errPrepare error
+	ctx, errPrepare = m.prepareExecutionContext(ctx, normalized, req, opts)
+	if errPrepare != nil {
+		return nil, errPrepare
 	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
@@ -2174,4 +2186,25 @@ func syncMetadataSessionToContext(ctx context.Context, metadata map[string]any) 
 	}
 	ctx = logging.WithClientRequestMetadata(ctx, clientMeta)
 	return util.WithSessionID(ctx, clientMeta.SessionID)
+}
+
+// prepareExecutionContext initializes optional provider state once, before the
+// credential and request retry loops. It does not alter nonparticipating providers.
+func (m *Manager) prepareExecutionContext(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (context.Context, error) {
+	for _, provider := range providers {
+		executor, ok := m.Executor(provider)
+		if !ok {
+			continue
+		}
+		if preparer, ok := executor.(interface {
+			PrepareExecutionContext(context.Context, cliproxyexecutor.Request, cliproxyexecutor.Options) (context.Context, error)
+		}); ok {
+			next, err := preparer.PrepareExecutionContext(ctx, req, opts)
+			if err != nil {
+				return ctx, err
+			}
+			ctx = next
+		}
+	}
+	return ctx, nil
 }

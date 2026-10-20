@@ -44,6 +44,60 @@ upstream acceptance, current account entitlement, award amounts or actual
 anti-abuse behavior. Those checks remain pending until a test account is
 provided.
 
+## Implementation status
+
+The credential/transport foundation is merged. Core execution is being developed
+in `feat/workbuddy-proxy`; deployment is still pending. Offline coverage now
+includes the native executor, OpenAI Chat/Responses, Claude and Gemini response
+translation, SSE/nonstream collection, parallel tool calls, usage accounting,
+401 refresh with persistence before replay, and SDK-scoped retry decisions.
+HTTP errors and error envelopes inside HTTP 200 streams share the risk classifier.
+A truncated stream is an error; once a chunk was emitted it cannot be replayed
+on another credential. Only a pre-output connection failure gets one retry.
+
+The static model catalog is an offline snapshot. It is not evidence of live
+model availability. Native credential `models` can explicitly restrict the
+published models, including synthetic models used by offline tests.
+
+The governor and transport pools are shared across executor replacements.
+Configuration reloads preserve cooldowns, restrictions and usage. Changing the
+state directory requires a restart; the old directory must be migrated explicitly.
+Only one process may own a state directory. The isolated deployment will use a
+single replica and its own PVC.
+
+The remaining stage-2 work includes live model discovery, conversation paging,
+affinity policy, content-rejection degradation, region/model entitlement holds,
+optional exit backoff, identity switching and paid fallback. Stage-3 quota and
+activity jobs are not implemented or enabled yet. These gaps must be closed
+before claiming parity with the reference project's risk controls.
+
+An explicit v8 configuration enables the provider:
+
+```yaml
+oauth:
+  auth-dir: /data/workbuddy-auth
+  providers:
+    workbuddy:
+      enabled: true
+      state-dir: /data/workbuddy-state
+      max-concurrency: 32
+      per-caller-concurrency: 2
+      queue-seconds: 30
+      limits:
+        daily-tokens: 0
+        daily-credits: 0
+        reserve-credits: 0
+```
+
+Zero budgets disable that local limit. Regional limit blocks replace the global
+budget block for that region. A positive credit reserve requires an observed
+balance, so requests remain gated while balance is unknown. Tokens and credits
+are recorded from upstream observations only; credits are never inferred from
+token counts. Concurrent requests can complete beyond a configured budget.
+Queue deadlines end at admission and never become upstream network deadlines.
+The general management HTTP tunnel is unsupported for this provider; arbitrary
+requests must not bypass its risk governor or export credentials to another host.
+
 ## Credential setup
 
 Use a separate configuration and auth directory for this test service. Never
@@ -87,6 +141,8 @@ contact WorkBuddy or inspect any existing account files.
 ```sh
 go test ./internal/workbuddy ./sdk/auth ./internal/watcher/synthesizer \
   ./internal/cmd ./cmd/server
+go test ./internal/runtime/executor ./internal/runtime/executor/helps \
+  ./sdk/cliproxy/auth ./sdk/cliproxy ./internal/config -run TestWorkBuddy
 go build -o test-output ./cmd/server
 rm test-output
 ```

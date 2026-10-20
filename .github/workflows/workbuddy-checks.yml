@@ -29,3 +29,7 @@ jobs:
         env:
           CGO_ENABLED: '1'
         run: go test -race -timeout 120s ./internal/workbuddy ./sdk/auth ./internal/watcher/synthesizer
+      - name: Test native executor and SDK retry integration under the race detector
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -timeout 180s ./internal/runtime/executor ./internal/runtime/executor/helps ./sdk/cliproxy/auth ./sdk/cliproxy -run TestWorkBuddy
