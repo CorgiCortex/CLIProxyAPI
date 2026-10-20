@@ -187,6 +187,9 @@ func matchRequestScopedErrorAction(auth *Auth, err error, cfg *internalconfig.Co
 	if err == nil {
 		return "", false
 	}
+	if action, ok := nativeExecutionErrorAction(err); ok {
+		return action, true
+	}
 	rules := extractRequestScopedErrorRules(auth, cfg)
 	if len(rules) == 0 {
 		return "", false
@@ -252,4 +255,17 @@ func applyRequestScopedActionToResult(action string, okAction bool, result *Resu
 
 func isRequestScopedStop(action string, okAction bool) bool {
 	return okAction && (action == RequestScopedActionStop || action == RequestScopedActionStopAndCooldown)
+}
+
+// nativeExecutionErrorAction is an opt-in policy for executors that already
+// own auth refresh, retries and scope-specific cooldowns.
+func nativeExecutionErrorAction(err error) (string, bool) {
+	var native interface{ NativeExecutionErrorAction() string }
+	if errors.As(err, &native) {
+		switch action := native.NativeExecutionErrorAction(); action {
+		case RequestScopedActionStop, RequestScopedActionContinue:
+			return action, true
+		}
+	}
+	return "", false
 }

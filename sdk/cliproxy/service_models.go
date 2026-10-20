@@ -9,8 +9,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/workbuddy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	log "github.com/sirupsen/logrus"
 )
 
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
@@ -193,6 +197,48 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "workbuddy":
+		if cfg != nil && cfg.WorkBuddy.Enabled {
+			if credential, err := helps.WorkBuddyCredential(a); err == nil {
+				if len(credential.Models) > 0 {
+					for _, id := range credential.Models {
+						models = append(models, &registry.ModelInfo{ID: id, Object: "model", OwnedBy: "workbuddy", Type: "workbuddy", UserDefined: true})
+					}
+				} else {
+					catalog := workbuddy.Catalog(credential.Realm)
+					if s.coreManager != nil {
+						if provider, ok := s.coreManager.Executor("workbuddy"); ok {
+							if native, okNative := provider.(*executor.WorkBuddyExecutor); okNative && native.UsesConfig(cfg) {
+								if observed, errCatalog := native.ModelCatalog(a); errCatalog == nil {
+									catalog = observed
+								} else {
+									log.WithField("provider", "workbuddy").Warn("cached model catalog unavailable; using static snapshot")
+								}
+							}
+						}
+					}
+					for _, model := range catalog {
+						if !model.Advertise {
+							continue
+						}
+						modalities := []string{"TEXT"}
+						if model.Images {
+							modalities = append(modalities, "IMAGE")
+						}
+						info := &registry.ModelInfo{ID: model.ID, Object: "model", OwnedBy: "workbuddy", Type: "workbuddy", DisplayName: model.Name, ContextLength: model.Context, MaxCompletionTokens: model.Output, InputTokenLimit: model.Input, OutputTokenLimit: model.Output, SupportedInputModalities: modalities}
+						if model.Reasoning {
+							levels := append([]string(nil), model.Thinking.Levels...)
+							if len(levels) == 0 && model.Thinking.Effort != "" {
+								levels = []string{model.Thinking.Effort}
+							}
+							info.Thinking = &registry.ThinkingSupport{Levels: levels, ZeroAllowed: model.Thinking.CanDisable == nil || *model.Thinking.CanDisable}
+						}
+						models = append(models, info)
+					}
+				}
 			}
 		}
 		models = applyExcludedModels(models, excluded)

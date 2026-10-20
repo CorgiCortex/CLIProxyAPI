@@ -323,6 +323,19 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 			}
 		}
 		s.coreManager.RegisterExecutor(executor.NewXAIAutoExecutor(cfg))
+	case "workbuddy":
+		var previous *executor.WorkBuddyExecutor
+		if current, ok := s.coreManager.Executor("workbuddy"); ok {
+			previous, _ = current.(*executor.WorkBuddyExecutor)
+			if previous != nil && previous.UsesConfig(cfg) {
+				previous.TrackAuth(a)
+				return
+			}
+		}
+		next := executor.NewWorkBuddyExecutor(cfg, previous)
+		next.BindCredentialManager(s.coreManager)
+		next.TrackAuth(a)
+		s.coreManager.RegisterExecutor(next)
 	case "devin":
 		s.coreManager.RegisterExecutor(executor.NewDevinExecutor(cfg))
 	case "meta":

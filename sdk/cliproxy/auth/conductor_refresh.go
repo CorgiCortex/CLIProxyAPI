@@ -714,6 +714,9 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 	if m == nil || auth == nil || alreadyTried || execErr == nil {
 		return auth, false
 	}
+	if _, handled := nativeExecutionErrorAction(execErr); handled {
+		return auth, false
+	}
 	// Request-scoped failures describe this request, not stale credentials.
 	// Refreshing would turn a direct error response into an implicit retry.
 	if isRequestScopedError(execErr) {
