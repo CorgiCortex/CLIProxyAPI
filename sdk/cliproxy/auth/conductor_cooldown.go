@@ -2628,6 +2628,12 @@ func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Local admission pressure is availability-neutral but may use another
+	// credential. It must not be treated as an invalid client request.
+	var admission interface{ RetryOtherCredential() bool }
+	if errors.As(err, &admission) && admission.RetryOtherCredential() {
+		return false
+	}
 	if isRequestScopedError(err) {
 		return true
 	}

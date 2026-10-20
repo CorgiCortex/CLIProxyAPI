@@ -222,6 +222,7 @@ func baselineExecutorAuths() []*coreauth.Auth {
 		"xai",
 		"devin",
 		"meta",
+		"zcode",
 		"openai-compatibility",
 	}
 	auths := make([]*coreauth.Auth, 0, len(providers))
@@ -327,6 +328,16 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		s.coreManager.RegisterExecutor(executor.NewDevinExecutor(cfg))
 	case "meta":
 		s.coreManager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+	case "zcode":
+		if current, ok := s.coreManager.Executor("zcode"); ok {
+			if native, okNative := current.(*executor.ZCodeExecutor); okNative {
+				if forceReplace {
+					s.coreManager.RegisterExecutor(native.WithConfig(cfg))
+				}
+				return
+			}
+		}
+		s.coreManager.RegisterExecutor(executor.NewZCodeExecutor(cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
