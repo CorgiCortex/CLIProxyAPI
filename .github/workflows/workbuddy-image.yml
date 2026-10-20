@@ -3,7 +3,7 @@ name: WorkBuddy isolated image
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, feat/workbuddy-proxy]
     paths:
       - 'internal/workbuddy/**'
       - 'internal/runtime/executor/workbuddy*'
