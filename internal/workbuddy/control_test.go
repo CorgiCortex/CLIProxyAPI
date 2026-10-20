@@ -173,3 +173,31 @@ func TestWorkBuddyControlBodyAndContext(t *testing.T) {
 		t.Fatal("background upstream has a deadline")
 	}
 }
+
+func TestWorkBuddyRewardAndMetadataReadsCanRecoverCreditParking(t *testing.T) {
+	var calls atomic.Int32
+	a, c, _ := controlFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); fmt.Fprint(w, `{"code":0,"data":{}}`) })
+	if err := a.Governor.UpdateLimits(Limits{ReserveCredits: 10}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Governor.RecordFailure(*c, "chat", Fault{Kind: FaultBalance, Status: 402}, FailureOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []ControlRequest{{Operation: ControlModels}, {Operation: ControlGrowthTasks}, {Operation: ControlGrowthAccept, TaskCodes: []string{"chat_5"}}, {Operation: ControlGrowthClaim, TaskCode: "chat_5"}} {
+		if _, err := a.Call(context.Background(), request); err != nil {
+			t.Fatalf("non-billable recovery operation %s blocked: %v", request.Operation, err)
+		}
+	}
+	if gate, _ := a.Governor.Check(*c, "chat", true, false); gate.Reason != "balance_empty" {
+		t.Fatal("metadata/reward response cleared credit parking without a balance observation")
+	}
+	if calls.Load() != 4 {
+		t.Fatal("recovery operations missing")
+	}
+	if _, err := a.Governor.RecordFailure(*c, "chat", Fault{Kind: FaultRestricted, Status: 403, Code: 11140}, FailureOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Call(context.Background(), ControlRequest{Operation: ControlGrowthClaim, TaskCode: "chat_5"}); err == nil || calls.Load() != 4 {
+		t.Fatal("reward operation bypassed account restriction")
+	}
+}

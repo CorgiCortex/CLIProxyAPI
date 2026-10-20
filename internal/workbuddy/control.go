@@ -52,7 +52,10 @@ type controlSpec struct {
 var taskCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func (r ControlRequest) spec(c Credential, now time.Time) (controlSpec, error) {
-	s := controlSpec{method: http.MethodPost, body: struct{}{}}
+	// These closed-set endpoints inspect metadata/balances or acquire rewards;
+	// none performs paid inference. Credit parking must not prevent recovery.
+	// The governor still checks every account, region and endpoint cooldown.
+	s := controlSpec{method: http.MethodPost, body: struct{}{}, observeBalance: true}
 	page := r.Page
 	if page == 0 {
 		page = 1
