@@ -1896,7 +1896,14 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if !handled {
 		selectorCtx := selectorContextForAvailableAuths(ctx, selector, model)
 		selectorCtx = withSessionAffinityTransientAuthIDs(selectorCtx, transientAuthIDs)
-		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
+		if native, ok := executor.(ProviderAuthSelector); ok {
+			selected, errPick = native.SelectAuth(selectorCtx, model, opts, available)
+			if errPick == nil {
+				selected, errPick = validateNativeSelection(selected, available)
+			}
+		} else {
+			selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
+		}
 		if errPick != nil {
 			if isBuiltInSelector(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
@@ -2094,7 +2101,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasNativeAuthSelector([]string{provider}) || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
@@ -2259,6 +2266,23 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if !okExecutor {
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	if !handled {
+		if native, ok := executor.(ProviderAuthSelector); ok {
+			group := make([]*Auth, 0, len(available))
+			for _, candidate := range available {
+				if executorKeyFromAuth(candidate) == providerKey {
+					group = append(group, candidate)
+				}
+			}
+			selected, errPick = native.SelectAuth(ctx, model, opts, group)
+			if errPick == nil {
+				selected, errPick = validateNativeSelection(selected, group)
+			}
+			if errPick != nil {
+				return nil, nil, "", errPick
+			}
+		}
+	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -2279,7 +2303,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if m.hasNativeAuthSelector(providers) || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 
@@ -2463,4 +2487,25 @@ func (m *Manager) warnLogAuthUnavailable(ctx context.Context, providers []string
 			entry.Warnf("auth unavailable: %d of %d candidate(s) for model %q (providers=%s) are in cooldown: %s", len(coolingSummaries), totalCandidates, model, providerText, strings.Join(coolingSummaries, ", "))
 		}
 	}
+}
+
+func (m *Manager) hasNativeAuthSelector(providers []string) bool {
+	for _, provider := range providers {
+		if executor, ok := m.Executor(provider); ok {
+			if _, native := executor.(ProviderAuthSelector); native {
+				return true
+			}
+		}
+	}
+	return false
+}
+func validateNativeSelection(selected *Auth, candidates []*Auth) (*Auth, error) {
+	if selected != nil {
+		for _, candidate := range candidates {
+			if candidate.ID == selected.ID {
+				return candidate, nil
+			}
+		}
+	}
+	return nil, &Error{Code: "auth_not_found", Message: "provider selector returned an ineligible auth"}
 }

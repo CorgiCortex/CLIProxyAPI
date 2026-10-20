@@ -300,3 +300,9 @@ func (m *Manager) ResultPolicy() ResultPolicy {
 	}
 	return holder.policy
 }
+
+// ProviderAuthSelector optionally refines selection among already eligible,
+// authorized credentials. Implementations must return one supplied candidate.
+type ProviderAuthSelector interface {
+	SelectAuth(context.Context, string, cliproxyexecutor.Options, []*Auth) (*Auth, error)
+}

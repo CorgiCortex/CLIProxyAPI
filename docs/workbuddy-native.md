@@ -72,10 +72,24 @@ account may use the model. A later successful check clears the mark; older
 in-flight completions cannot erase newer evidence. Model configuration errors
 `11129` and `11150` also stop rotation without penalizing the account.
 
-The remaining stage-2 work includes live model discovery, conversation paging,
-affinity policy, content-rejection degradation, optional exit backoff, identity switching and paid fallback. Stage-3 quota and
-activity jobs are not implemented or enabled yet. These gaps must be closed
-before claiming parity with the reference project's risk controls.
+Conversation affinity keeps three recent eligible accounts per caller/session
+for two hours. Conversations beyond 400 messages use stable account pages
+(default size three); cooldowns do not change page membership. Native selection
+still honors SDK pins, exclusions, priority and the final governor check.
+
+Content rejection can replace the built-in prompt with a neutral prompt until
+CST midnight, with one retry per request. Custom prompts are excluded. Optional
+exit backoff shares failures by origin/proxy and caps waiting at five seconds
+per logical request. Optional product switching persists the new identity before
+retrying and permits at most four switches per account/model per minute.
+Restrictions and durable free-model caps survive identity changes. Optional paid
+fallback applies only to international DeepSeek Flash when every enabled account
+in that region has an active free-model cap; paid budgets are checked again.
+All rebuilt requests pass through the final payload-rule barrier exactly once.
+
+The remaining stage-2 work is live model discovery. Stage-3 quota and activity
+jobs are not implemented or enabled yet. These gaps must be closed before
+claiming parity with the reference project's risk controls.
 
 An explicit v8 configuration enables the provider:
 

@@ -268,10 +268,7 @@ func (g *Governor) Check(c Credential, model string, paid, balanceOnly bool) (Ga
 	if gate.Reason != "" {
 		return gate, attempt
 	}
-	if balanceOnly {
-		return gate, attempt
-	}
-	if now.Before(state.BalanceUntil) {
+	if !balanceOnly && now.Before(state.BalanceUntil) {
 		gate.Reason, gate.Until = "balance_empty", state.BalanceUntil
 		return gate, attempt
 	}
@@ -281,6 +278,9 @@ func (g *Governor) Check(c Credential, model string, paid, balanceOnly bool) (Ga
 			gate.Reason, gate.Until = "model_cooldown", until
 			return gate, attempt
 		}
+	}
+	if balanceOnly {
+		return gate, attempt
 	}
 	limits := g.options.Limits
 	if override, exists := g.options.Realms[c.Realm]; exists {
@@ -560,4 +560,45 @@ func (g *Governor) Entitlement(realm Realm, model string) (EntitlementMark, bool
 	defer g.mu.Unlock()
 	mark, ok := g.state.Entitlements[realm][model]
 	return mark, ok && g.options.Now().Before(mark.Until)
+}
+
+func (g *Governor) Capped(c Credential, model string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	state := g.state.Accounts[RiskAccountKey(c)]
+	if state == nil {
+		return false
+	}
+	cap := state.Models[model]
+	return cap != nil && g.options.Now().Before(cap.CapUntil)
+}
+
+// ClearIdentityModelCooldown clears only the ordinary model cooldown after a
+// successful product change. Durable caps and account/region restrictions stay.
+func (g *Governor) ClearIdentityModelCooldown(c Credential, model string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.options.Now()
+	state := g.accountLocked(c)
+	if g.saveErr != nil || c.Disabled {
+		return false
+	}
+	if realm := g.state.Realms[c.Realm]; realm != nil && now.Before(realm.HoldUntil) {
+		return false
+	}
+	for _, until := range []time.Time{state.RestrictedUntil, state.BalanceUntil, state.CooldownUntil, state.BreakerUntil, state.DegradeUntil} {
+		if now.Before(until) {
+			return false
+		}
+	}
+	current := state.Models[model]
+	if current == nil {
+		return true
+	}
+	if now.Before(current.CapUntil) {
+		return false
+	}
+	current.CooldownUntil = time.Time{}
+	state.Version++
+	return true
 }

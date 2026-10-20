@@ -57,14 +57,18 @@ func ErrorForFault(f Fault) *DispatchError {
 
 type requestStateKey struct{}
 type RequestState struct {
-	mu            sync.Mutex
-	Turn          string
-	attempts, max int
-	charged       map[string]bool
-	refreshed     map[string]bool
+	Route          SessionRoute
+	mu             sync.Mutex
+	Turn           string
+	attempts, max  int
+	charged        map[string]bool
+	refreshed      map[string]bool
+	exits          map[string]bool
+	degraded, paid bool
+	delay          time.Duration
 }
 
-func WithRequestState(ctx context.Context, accounts int) (context.Context, error) {
+func WithRequestState(ctx context.Context, accounts int, extra ...int) (context.Context, error) {
 	if _, ok := ctx.Value(requestStateKey{}).(*RequestState); ok {
 		return ctx, nil
 	}
@@ -75,7 +79,11 @@ func WithRequestState(ctx context.Context, accounts int) (context.Context, error
 	if accounts < 2 {
 		accounts = 2
 	}
-	state := &RequestState{Turn: turn, max: accounts + 1, charged: make(map[string]bool), refreshed: make(map[string]bool)}
+	additional := 0
+	if len(extra) > 0 && extra[0] > 0 {
+		additional = extra[0]
+	}
+	state := &RequestState{Turn: turn, max: accounts + 1 + additional, exits: make(map[string]bool), charged: make(map[string]bool), refreshed: make(map[string]bool)}
 	return context.WithValue(ctx, requestStateKey{}, state), nil
 }
 func State(ctx context.Context) *RequestState {
@@ -184,4 +192,45 @@ func (l *Limiter) Configure(global, perKey int) error {
 	close(l.changed)
 	l.changed = make(chan struct{})
 	return nil
+}
+
+func (s *RequestState) TryDegrade() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.degraded {
+		return false
+	}
+	s.degraded = true
+	return true
+}
+func (s *RequestState) TryPaidFallback() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.paid {
+		return false
+	}
+	s.paid = true
+	return true
+}
+func (s *RequestState) ChargeExit(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exits[key] {
+		return false
+	}
+	s.exits[key] = true
+	return true
+}
+func (s *RequestState) ReserveDelay(requested time.Duration) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := 5*time.Second - s.delay
+	if requested > remaining {
+		requested = remaining
+	}
+	if requested < 0 {
+		requested = 0
+	}
+	s.delay += requested
+	return requested
 }

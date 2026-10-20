@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,12 +62,54 @@ func (e *WorkBuddyExecutor) TrackAuth(a *coreauth.Auth) {
 		e.runtime.Track(a)
 	}
 }
-func (e *WorkBuddyExecutor) PrepareExecutionContext(ctx context.Context, _ execution.Request, _ execution.Options) (context.Context, error) {
+func (e *WorkBuddyExecutor) PrepareExecutionContext(ctx context.Context, req execution.Request, opts execution.Options) (context.Context, error) {
 	if e.initErr != nil {
 		return ctx, &workbuddy.DispatchError{Reason: "provider_unavailable", Status: 503, Stop: true}
 	}
-	return workbuddy.WithRequestState(ctx, e.runtime.Accounts())
+	if workbuddy.State(ctx) != nil {
+		return ctx, nil
+	}
+	extra := 0
+	if e.cfg.WorkBuddy.AutoSwitchProduct {
+		extra = 4
+	}
+	next, err := workbuddy.WithRequestState(ctx, e.runtime.Accounts(), extra)
+	if err != nil {
+		return ctx, err
+	}
+	prefix, maxMessages, pageSize := true, 400, 3
+	if e.cfg.WorkBuddy.AffinityByPrefix != nil {
+		prefix = *e.cfg.WorkBuddy.AffinityByPrefix
+	}
+	if e.cfg.WorkBuddy.AffinityMaxMessages != nil {
+		maxMessages = *e.cfg.WorkBuddy.AffinityMaxMessages
+	}
+	if e.cfg.WorkBuddy.AffinityPageSize != nil {
+		pageSize = *e.cfg.WorkBuddy.AffinityPageSize
+	}
+	caller, _ := opts.Metadata[execution.CallerScopeMetadataKey].(string)
+	explicit, _ := opts.Metadata[execution.ExecutionSessionMetadataKey].(string)
+	if explicit == "" {
+		for _, key := range []string{"X-Conversation-Id", "X-Session-Id", "Session_id", "X-Codex-Session-Id"} {
+			if value := opts.Headers.Get(key); value != "" {
+				explicit = value
+				break
+			}
+		}
+	}
+	if explicit == "" {
+		for _, key := range []string{"conversation_id", "session_id", "metadata.session_id"} {
+			if value := gjson.GetBytes(req.Payload, key).String(); value != "" {
+				explicit = value
+				break
+			}
+		}
+	}
+	payload := sdktranslator.TranslateRequest(opts.SourceFormat, sdktranslator.FromString("openai"), req.Model, req.Payload, opts.Stream)
+	workbuddy.State(next).Route = workbuddy.SessionRouting(caller, explicit, payload, prefix, maxMessages, pageSize)
+	return next, nil
 }
+
 func (e *WorkBuddyExecutor) ShouldPrepareRequestAuth(a *coreauth.Auth) bool {
 	c, err := helps.WorkBuddyCredential(a)
 	return err == nil && c.RefreshToken != "" && c.Expiring(time.Now())
@@ -95,11 +138,14 @@ func (e *WorkBuddyExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.R
 	return nil, &workbuddy.DispatchError{Reason: "arbitrary_http_requests_are_not_supported", Status: 400, Stop: true}
 }
 
-func (e *WorkBuddyExecutor) build(ctx context.Context, c workbuddy.Credential, req execution.Request, opts execution.Options) ([]byte, error) {
+func (e *WorkBuddyExecutor) build(ctx context.Context, c workbuddy.Credential, req execution.Request, opts execution.Options, override ...string) ([]byte, error) {
 	if opts.Alt != "" {
 		return nil, &workbuddy.DispatchError{Reason: "unsupported_endpoint", Status: 400, Stop: true}
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if len(override) > 0 && override[0] != "" {
+		baseModel = override[0]
+	}
 	from, to := opts.SourceFormat, sdktranslator.FromString("openai")
 	original := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -114,7 +160,7 @@ func (e *WorkBuddyExecutor) build(ctx context.Context, c workbuddy.Credential, r
 	if err != nil {
 		return nil, err
 	}
-	body, err = helps.NormalizeWorkBuddyPayload(body, c, baseModel)
+	body, err = helps.NormalizeWorkBuddyPayload(body, c, baseModel, helps.WorkBuddyPrompt(e.cfg.WorkBuddy.Prompt, e.runtime.Policy.Degraded()))
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +212,9 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		}
 	}()
 	preOutputRetry := false
+	paidModel := ""
 	for {
-		body, errBuild := e.build(ctx, c, req, opts)
+		body, errBuild := e.build(ctx, c, req, opts, paidModel)
 		if errBuild != nil {
 			return errBuild
 		}
@@ -182,12 +229,19 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		}
 		gate, attempt := e.runtime.Governor.Check(c, model, workbuddy.IsPaidModel(c.Realm, model), false)
 		if !gate.Allowed() {
+			if !gate.Stop && gate.Reason == "model_cooldown" && e.paidFallback(c, model, state, paidModel) {
+				paidModel = "deepseek-v4.1-flash-sg"
+				continue
+			}
 			return &workbuddy.DispatchError{Reason: gate.Reason, Status: 429, Stop: gate.Stop, Until: gate.Until}
 		}
 		if errBegin := state.Begin(); errBegin != nil {
 			return errBegin
 		}
 		session := helps.DerivedSessionID(opts.Metadata, req.Metadata)
+		if state.Route.Key != "" {
+			session = state.Route.Key
+		}
 		if c.Product == workbuddy.VSCode {
 			session = state.Turn
 		}
@@ -230,7 +284,7 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		execution.MarkUpstreamAttempt(ctx)
 		response, errDo := client.Do(httpReq)
 		if errDo != nil {
-			return e.recordFailure(c, model, state, workbuddy.ClassifyTransport(errDo))
+			return e.connectionFailure(ctx, c, model, state, workbuddy.ClassifyTransport(errDo), base, proxy)
 		}
 		reporter.ObserveResponse(response)
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -251,7 +305,22 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 					continue
 				}
 			}
-			return e.recordFailure(c, model, state, fault)
+			updated, failure, retry := e.recoverFailure(ctx, a, c, model, state, fault, base, proxy, paidModel == "")
+			if retry {
+				if updated != nil {
+					a = updated
+					c, err = helps.WorkBuddyCredential(a)
+					if err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if fault.Kind == workbuddy.FaultModelCap && e.paidFallback(c, model, state, paidModel) {
+				paidModel = "deepseek-v4.1-flash-sg"
+				continue
+			}
+			return failure
 		}
 		emitted := false
 		var usage json.RawMessage
@@ -302,6 +371,10 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 			return &workbuddy.DispatchError{Reason: "usage_persistence_failed", Status: 503, Stop: true}
 		}
 		if errStream == nil {
+			e.runtime.Policy.ProductSuccess(c, model)
+			if e.cfg.WorkBuddy.EgressBackoff {
+				e.runtime.Policy.ExitSuccess(base, proxy)
+			}
 			return consume([]byte("[DONE]"), body)
 		}
 		if ctx.Err() != nil {
@@ -309,6 +382,24 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 		}
 		var upstreamFault *workbuddy.StreamFault
 		if errors.As(errStream, &upstreamFault) {
+			if !emitted {
+				updated, failure, retry := e.recoverFailure(ctx, a, c, model, state, upstreamFault.Fault, base, proxy, paidModel == "")
+				if retry {
+					if updated != nil {
+						a = updated
+						c, err = helps.WorkBuddyCredential(a)
+						if err != nil {
+							return err
+						}
+					}
+					continue
+				}
+				if upstreamFault.Fault.Kind == workbuddy.FaultModelCap && e.paidFallback(c, model, state, paidModel) {
+					paidModel = "deepseek-v4.1-flash-sg"
+					continue
+				}
+				return failure
+			}
 			failure := e.recordFailure(c, model, state, upstreamFault.Fault)
 			var dispatch *workbuddy.DispatchError
 			if emitted && errors.As(failure, &dispatch) {
@@ -324,10 +415,20 @@ func (e *WorkBuddyExecutor) execute(ctx context.Context, a *coreauth.Auth, req e
 			}
 			if fault.Kind == workbuddy.FaultConnection {
 				preOutputRetry = true
+				if e.cfg.WorkBuddy.EgressBackoff {
+					if errWait := e.runtime.Policy.Backoff(ctx, state, base, proxy); errWait != nil {
+						return errWait
+					}
+				}
 				continue
 			}
 		}
-		failure := e.recordFailure(c, model, state, workbuddy.Fault{Kind: workbuddy.FaultUnknown, Status: 502})
+		var failure error
+		if e.cfg.WorkBuddy.EgressBackoff {
+			failure = e.connectionFailure(ctx, c, model, state, workbuddy.Fault{Kind: workbuddy.FaultConnection, Status: 502}, base, proxy)
+		} else {
+			failure = e.recordFailure(c, model, state, workbuddy.Fault{Kind: workbuddy.FaultUnknown, Status: 502})
+		}
 		// Once output escaped, no SDK credential rotation may replay the prompt.
 		var dispatch *workbuddy.DispatchError
 		if errors.As(failure, &dispatch) {
@@ -343,6 +444,7 @@ func (e *WorkBuddyExecutor) recordFailure(c workbuddy.Credential, model string, 
 	if fault.Kind == workbuddy.FaultHard || fault.Kind == workbuddy.FaultUnknown {
 		charge = state.Charge(c)
 	}
+	e.runtime.Affinity.Demote(c.Realm, state.Route, c.UID)
 	failure := workbuddy.ErrorForFault(fault)
 	if charge {
 		gate, err := e.runtime.Governor.RecordFailure(c, model, fault, workbuddy.FailureOptions{FreeModel: workbuddy.IsFreeCapModel(c.Realm, model), SingleAccount: e.runtime.Accounts() <= 1})
@@ -432,4 +534,110 @@ func (e *WorkBuddyExecutor) CountTokens(ctx context.Context, a *coreauth.Auth, r
 	}
 	result := sdktranslator.TranslateTokenCount(ctx, sdktranslator.FromString("openai"), execution.ResponseFormatOrSource(opts), count, helps.BuildOpenAIUsageJSON(count))
 	return execution.Response{Payload: result}, nil
+}
+
+// recoverFailure runs only before downstream output. Each retry rebuilds from
+// the original request and crosses the payload finalizer once again.
+func (e *WorkBuddyExecutor) recoverFailure(ctx context.Context, a *coreauth.Auth, c workbuddy.Credential, model string, state *workbuddy.RequestState, fault workbuddy.Fault, base, proxy string, allowSwitch bool) (*coreauth.Auth, error, bool) {
+	if fault.Kind == workbuddy.FaultContent && e.cfg.WorkBuddy.Prompt.Mode != "custom" && state.TryDegrade() {
+		e.runtime.Policy.Degrade()
+		return nil, nil, true
+	}
+	if fault.Kind == workbuddy.FaultGateway && e.cfg.WorkBuddy.EgressBackoff {
+		return nil, e.connectionFailure(ctx, c, model, state, fault, base, proxy), false
+	}
+	failure := e.recordFailure(c, model, state, fault)
+	var dispatch *workbuddy.DispatchError
+	if !errors.As(failure, &dispatch) || dispatch.Stop {
+		return nil, failure, false
+	}
+	if allowSwitch && e.cfg.WorkBuddy.AutoSwitchProduct && (fault.Kind == workbuddy.FaultModelRate || fault.Kind == workbuddy.FaultModelCap) && !e.runtime.Governor.Capped(c, model) {
+		allowed := make([]workbuddy.Product, 0, len(e.cfg.WorkBuddy.AutoSwitchProducts))
+		for _, p := range e.cfg.WorkBuddy.AutoSwitchProducts {
+			allowed = append(allowed, workbuddy.Product(p))
+		}
+		if next, ok := e.runtime.Policy.NextProduct(c, model, allowed); ok {
+			updated, err := e.runtime.SwitchProduct(ctx, a, next)
+			if err == nil && e.runtime.Governor.ClearIdentityModelCooldown(c, model) {
+				return updated, nil, true
+			}
+		}
+	}
+	return nil, failure, false
+}
+func (e *WorkBuddyExecutor) connectionFailure(ctx context.Context, c workbuddy.Credential, model string, state *workbuddy.RequestState, fault workbuddy.Fault, base, proxy string) error {
+	if e.cfg.WorkBuddy.EgressBackoff && (fault.Kind == workbuddy.FaultGateway || fault.Kind == workbuddy.FaultConnection) {
+		if err := e.runtime.Policy.Backoff(ctx, state, base, proxy); err != nil {
+			return err
+		}
+		return workbuddy.ErrorForFault(fault)
+	}
+	return e.recordFailure(c, model, state, fault)
+}
+func (e *WorkBuddyExecutor) paidFallback(c workbuddy.Credential, model string, state *workbuddy.RequestState, current string) bool {
+	return current == "" && e.cfg.WorkBuddy.PaidFallback && c.Realm == workbuddy.International && model == "deepseek-v4.1-flash" && e.runtime.AllFreeCapped(c.Realm, model) && state.TryPaidFallback()
+}
+
+// SelectAuth runs after SDK model, pin, caller eligibility and priority checks.
+// It never introduces a credential outside the candidate set supplied by SDK.
+func (e *WorkBuddyExecutor) SelectAuth(ctx context.Context, model string, opts execution.Options, candidates []*coreauth.Auth) (*coreauth.Auth, error) {
+	if len(candidates) == 0 {
+		return nil, &workbuddy.DispatchError{Reason: "no_eligible_credentials", Status: 503, Stop: true}
+	}
+	state := workbuddy.State(ctx)
+	if state == nil {
+		return candidates[0], nil
+	}
+	baseModel := thinking.ParseSuffix(model).ModelName
+	byRealm := make(map[workbuddy.Realm]map[string]*coreauth.Auth)
+	for _, candidate := range candidates {
+		c, err := helps.WorkBuddyCredential(candidate)
+		if err != nil {
+			continue
+		}
+		gate, _ := e.runtime.Governor.Check(c, baseModel, workbuddy.IsPaidModel(c.Realm, baseModel), false)
+		eligible := gate.Allowed() || gate.Reason == "credential_expired" && c.RefreshToken != ""
+		if !eligible && gate.Reason == "model_cooldown" && e.cfg.WorkBuddy.PaidFallback && baseModel == "deepseek-v4.1-flash" && c.Realm == workbuddy.International && e.runtime.AllFreeCapped(c.Realm, baseModel) {
+			paidGate, _ := e.runtime.Governor.Check(c, "deepseek-v4.1-flash-sg", true, false)
+			eligible = paidGate.Allowed()
+		}
+		if !eligible {
+			continue
+		}
+		if byRealm[c.Realm] == nil {
+			byRealm[c.Realm] = make(map[string]*coreauth.Auth)
+		}
+		previous := byRealm[c.Realm][c.UID]
+		if previous == nil || candidate.ID < previous.ID {
+			byRealm[c.Realm][c.UID] = candidate
+		}
+	}
+	// Shared model names prefer the international realm. Explicit auth prefixes
+	// and pins are already narrowed by SDK and preserve China-only routes.
+	for _, realm := range []workbuddy.Realm{workbuddy.International, workbuddy.China} {
+		group := byRealm[realm]
+		if len(group) == 0 {
+			continue
+		}
+		eligible := make([]string, 0, len(group))
+		for uid := range group {
+			eligible = append(eligible, uid)
+		}
+		allSet := make(map[string]bool)
+		for _, c := range e.runtime.Credentials() {
+			if c.Realm == realm {
+				allSet[c.UID] = true
+			}
+		}
+		all := make([]string, 0, len(allSet))
+		for uid := range allSet {
+			all = append(all, uid)
+		}
+		uid := e.runtime.Affinity.Pick(realm, state.Route, eligible, all)
+		return group[uid], nil
+	}
+	// Let the executor report the precise gate and the SDK's normal retry loop
+	// handle exhausted tiers. Selection itself must not bypass a restriction.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	return candidates[0], nil
 }

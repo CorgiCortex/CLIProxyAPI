@@ -101,3 +101,48 @@ func (e *workBuddyRefreshTrap) Refresh(context.Context, *Auth) (*Auth, error) {
 	e.calls++
 	return nil, errors.New("unexpected refresh")
 }
+
+type workBuddyNativeSelectorExecutor struct {
+	mockCustomErrorExecutor
+	want  string
+	calls int
+}
+
+func (e *workBuddyNativeSelectorExecutor) SelectAuth(_ context.Context, _ string, _ execution.Options, candidates []*Auth) (*Auth, error) {
+	e.calls++
+	for _, a := range candidates {
+		if a.ID == e.want {
+			return a, nil
+		}
+	}
+	return &Auth{ID: e.want, Provider: "workbuddy"}, nil
+}
+func TestWorkBuddyNativeSelectorRespectsSDKCandidateBoundary(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	for _, id := range []string{"wb-select-a", "wb-select-b"} {
+		a := &Auth{ID: id, Provider: "workbuddy", Status: StatusActive}
+		if _, err := manager.Register(context.Background(), a); err != nil {
+			t.Fatal(err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(id, "workbuddy", []*registry.ModelInfo{{ID: "fixture-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+	executor := &workBuddyNativeSelectorExecutor{mockCustomErrorExecutor: mockCustomErrorExecutor{identifier: "workbuddy"}, want: "wb-select-b"}
+	manager.RegisterExecutor(executor)
+	selected, _, err := manager.pickNext(context.Background(), "workbuddy", "fixture-model", execution.Options{}, nil)
+	if err != nil || selected.ID != "wb-select-b" {
+		t.Fatalf("native selection = %v %v", selected, err)
+	}
+	selected, _, _, err = manager.pickNextMixed(context.Background(), []string{"workbuddy"}, "fixture-model", execution.Options{}, nil)
+	if err != nil || selected.ID != "wb-select-b" {
+		t.Fatalf("mixed native selection = %v %v", selected, err)
+	}
+	_, _, err = manager.pickNext(context.Background(), "workbuddy", "fixture-model", execution.Options{Metadata: map[string]any{execution.PinnedAuthMetadataKey: "wb-select-a"}}, nil)
+	if err == nil {
+		t.Fatal("provider selector bypassed explicit pinned auth")
+	}
+	_, _, err = manager.pickNext(context.Background(), "workbuddy", "fixture-model", execution.Options{}, map[string]struct{}{"wb-select-b": {}})
+	if err == nil {
+		t.Fatal("provider selector reintroduced excluded auth")
+	}
+}

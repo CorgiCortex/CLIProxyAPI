@@ -462,3 +462,168 @@ func TestWorkBuddyInflightRefreshCannotOverwriteExternalRotation(t *testing.T) {
 		t.Fatal("external persisted rotation overwritten")
 	}
 }
+
+func TestWorkBuddyContentDegradationRebuildsBeforeFinalBarrier(t *testing.T) {
+	var calls atomic.Int32
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "configured").String() != "yes" {
+			t.Error("payload rules missing on rebuilt attempt")
+		}
+		if calls.Add(1) == 1 {
+			if gjson.GetBytes(body, "messages.0.content").String() != "caller-system" {
+				t.Error("initial prompt rewritten")
+			}
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, `{"message":"content review"}`)
+			return
+		}
+		if gjson.GetBytes(body, "messages.0.content").String() != workbuddy.DegradedPrompt {
+			t.Error("retry did not degrade system prompt")
+		}
+		if gjson.GetBytes(body, "messages.1.content").String() != "user-content" {
+			t.Error("degradation altered user content")
+		}
+		_, _ = io.WriteString(w, wbSuccess)
+	})
+	e.cfg.Payload = config.PayloadConfig{Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "*"}}, Params: map[string]any{"configured": "yes"}}}}
+	req, opts := wbRequest()
+	req.Payload = []byte(`{"model":"fixture-model","messages":[{"role":"system","content":"caller-system"},{"role":"user","content":"user-content"}]}`)
+	if _, err := e.Execute(context.Background(), a, req, opts); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("attempts=%d", calls.Load())
+	}
+}
+func TestWorkBuddyCustomPromptNeverDegradesOrRetries(t *testing.T) {
+	var calls atomic.Int32
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "messages.0.content").String() != "custom-prompt" {
+			t.Error("custom prompt not applied")
+		}
+		w.WriteHeader(403)
+	})
+	e.cfg.WorkBuddy.Prompt = config.WorkBuddyPrompt{Mode: "custom", Text: "custom-prompt"}
+	req, opts := wbRequest()
+	if _, err := e.Execute(context.Background(), a, req, opts); err == nil {
+		t.Fatal("content rejection lost")
+	}
+	if calls.Load() != 1 || e.runtime.Policy.Degraded() {
+		t.Fatal("custom prompt opted into degradation")
+	}
+}
+func TestWorkBuddyProductSwitchPersistsBeforeRetry(t *testing.T) {
+	var calls atomic.Int32
+	var saved atomic.Int32
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(429)
+			_, _ = io.WriteString(w, `{"code":14003,"message":"too many requests"}`)
+			return
+		}
+		if r.Header.Get("X-IDE-Type") != "CLI" || saved.Load() != 1 {
+			t.Error("identity did not persist before retry")
+		}
+		_, _ = io.WriteString(w, wbSuccess)
+	})
+	e.cfg.WorkBuddy.AutoSwitchProduct = true
+	e.cfg.WorkBuddy.AutoSwitchProducts = []string{"workbuddy", "cli"}
+	e.runtime.Save = func(_ context.Context, _ *coreauth.Auth, next *coreauth.Auth) error {
+		if next.Metadata["product"] != "cli" {
+			t.Error("unexpected saved product")
+		}
+		saved.Add(1)
+		return nil
+	}
+	req, opts := wbRequest()
+	if _, err := e.Execute(context.Background(), a, req, opts); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("requests=%d", calls.Load())
+	}
+}
+func TestWorkBuddyPaidFallbackRequiresOptInAndEveryFreeAccountCapped(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		enabled, other bool
+		want           int
+	}{{"disabled", false, false, 1}, {"other-free-account", true, true, 1}, {"all-capped", true, false, 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				model := gjson.GetBytes(body, "model").String()
+				calls.Add(1)
+				if model == "deepseek-v4.1-flash" {
+					w.WriteHeader(429)
+					_, _ = io.WriteString(w, `{"code":6004,"message":"reset at 2099-10-22 00:00:00 UTC+8"}`)
+					return
+				}
+				if model != "deepseek-v4.1-flash-sg" {
+					t.Errorf("unexpected billed model %s", model)
+				}
+				_, _ = io.WriteString(w, wbSuccess)
+			})
+			e.cfg.WorkBuddy.PaidFallback = tc.enabled
+			if tc.other {
+				second := a.Clone()
+				second.ID = "second-fixture"
+				second.Metadata["uid"] = "second-fixture-user"
+				e.TrackAuth(second)
+			}
+			req, opts := wbRequest()
+			req.Model = "deepseek-v4.1-flash"
+			_, err := e.Execute(context.Background(), a, req, opts)
+			if tc.want == 2 && err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == 1 && err == nil {
+				t.Fatal("cap ignored")
+			}
+			if calls.Load() != int32(tc.want) {
+				t.Fatalf("requests=%d want %d", calls.Load(), tc.want)
+			}
+			c, _ := helps.WorkBuddyCredential(a)
+			if !e.runtime.Governor.Capped(c, "deepseek-v4.1-flash") {
+				t.Fatal("paid fallback cleared free cap")
+			}
+		})
+	}
+}
+
+func TestWorkBuddyNativeSelectionUsesWarmHistoryAndRiskGates(t *testing.T) {
+	e, a := wbFixture(t, func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, wbSuccess) })
+	b := a.Clone()
+	b.ID = "workbuddy-fixture-b"
+	b.Metadata["uid"] = "fixture-b"
+	e.TrackAuth(b)
+	req, opts := wbRequest()
+	ctx, err := e.PrepareExecutionContext(context.Background(), req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.SelectAuth(ctx, "fixture-model", opts, []*coreauth.Auth{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := e.SelectAuth(ctx, "fixture-model", opts, []*coreauth.Auth{b, a})
+	if err != nil || again.ID != first.ID {
+		t.Fatal("affinity followed candidate ordering")
+	}
+	c, _ := helps.WorkBuddyCredential(first)
+	if _, err := e.runtime.Governor.RecordFailure(c, "fixture-model", workbuddy.Fault{Kind: workbuddy.FaultModelRate}, workbuddy.FailureOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	switched, err := e.SelectAuth(ctx, "fixture-model", opts, []*coreauth.Auth{a, b})
+	if err != nil || switched.ID == first.ID {
+		t.Fatal("affinity bypassed model cooldown")
+	}
+	sibling, err := e.SelectAuth(ctx, "another-model", opts, []*coreauth.Auth{first})
+	if err != nil || sibling.ID != first.ID {
+		t.Fatal("model cooldown poisoned account")
+	}
+}

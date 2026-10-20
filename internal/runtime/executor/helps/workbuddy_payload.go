@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"io"
+	"os"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/workbuddy"
@@ -13,7 +16,7 @@ const workBuddySystemPrompt = "You are a helpful coding assistant."
 
 // NormalizeWorkBuddyPayload runs before the payload finalizer. It intentionally
 // preserves caller text, tool schemas and unknown public fields.
-func NormalizeWorkBuddyPayload(raw []byte, c workbuddy.Credential, model string) ([]byte, error) {
+func NormalizeWorkBuddyPayload(raw []byte, c workbuddy.Credential, model string, prompt ...WorkBuddyPromptPolicy) ([]byte, error) {
 	if len(raw) > 16<<20 {
 		return nil, &workbuddy.DispatchError{Reason: "request_body_too_large", Status: 413, Stop: true}
 	}
@@ -47,6 +50,9 @@ func NormalizeWorkBuddyPayload(raw []byte, c workbuddy.Credential, model string)
 				message["reasoning_content"] = ""
 			}
 		}
+	}
+	if len(prompt) > 0 {
+		messages = applyWorkBuddyPrompt(messages, prompt[0])
 	}
 	if len(messages) == 0 || messages[0].(map[string]any)["role"] != "system" {
 		messages = append([]any{map[string]any{"role": "system", "content": workBuddySystemPrompt}}, messages...)
@@ -181,4 +187,69 @@ func repairWorkBuddyTools(messages []any) []any {
 		}
 	}
 	return out
+}
+
+type WorkBuddyPromptPolicy struct {
+	Mode, Text string
+	Degraded   bool
+}
+
+// WorkBuddyPrompt resolves an explicitly configured local prompt file. A failed
+// read preserves the caller's prompt, matching the reference's fail-open mode.
+func WorkBuddyPrompt(cfg config.WorkBuddyPrompt, degraded bool) WorkBuddyPromptPolicy {
+	mode := cfg.Mode
+	if mode == "" {
+		mode = "passthrough"
+	}
+	policy := WorkBuddyPromptPolicy{Mode: mode, Text: cfg.Text, Degraded: degraded}
+	if mode == "custom" || mode == "append" {
+		if cfg.File != "" {
+			file, err := os.Open(cfg.File)
+			if err != nil {
+				return WorkBuddyPromptPolicy{Mode: "passthrough"}
+			}
+			raw, errRead := io.ReadAll(io.LimitReader(file, (1<<20)+1))
+			errClose := file.Close()
+			if errRead != nil || errClose != nil || len(raw) > 1<<20 || len(raw) == 0 {
+				return WorkBuddyPromptPolicy{Mode: "passthrough"}
+			}
+			policy.Text = string(raw)
+		}
+		if policy.Text == "" {
+			policy.Text = "You are an engineering assistant. Understand the code and context, follow existing conventions, make focused changes, verify results, and report uncertainty honestly."
+		}
+	}
+	return policy
+}
+func applyWorkBuddyPrompt(messages []any, policy WorkBuddyPromptPolicy) []any {
+	text := policy.Text
+	rewrite := policy.Mode == "custom"
+	if policy.Mode != "custom" && policy.Degraded {
+		rewrite = true
+		text = workbuddy.DegradedPrompt
+	}
+	if rewrite && text != "" {
+		out := []any{map[string]any{"role": "system", "content": text}}
+		for _, item := range messages {
+			m := item.(map[string]any)
+			if m["role"] != "system" && m["role"] != "developer" {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+	if policy.Mode == "append" && text != "" {
+		i := 0
+		for i < len(messages) {
+			role := messages[i].(map[string]any)["role"]
+			if role != "system" && role != "developer" {
+				break
+			}
+			i++
+		}
+		out := append([]any(nil), messages[:i]...)
+		out = append(out, map[string]any{"role": "system", "content": text})
+		return append(out, messages[i:]...)
+	}
+	return messages
 }

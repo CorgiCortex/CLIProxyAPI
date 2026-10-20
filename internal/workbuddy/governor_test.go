@@ -19,6 +19,20 @@ func governorFixture(t *testing.T, limits Limits) (*Governor, *time.Time, string
 	return g, &now, path
 }
 
+func TestWorkBuddyBalanceReadRespectsControlCooldown(t *testing.T) {
+	g, _, _ := governorFixture(t, Limits{ReserveCredits: 10})
+	c := testCredential()
+	if gate, _ := g.Check(c, "balance", false, true); !gate.Allowed() {
+		t.Fatal("unknown balance prevented a balance read")
+	}
+	if _, err := g.RecordFailure(c, "balance", Fault{Kind: FaultModelRate, Soft: true}, FailureOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if gate, _ := g.Check(c, "balance", false, true); gate.Reason != "model_cooldown" {
+		t.Fatal("balance read bypassed endpoint cooldown")
+	}
+}
+
 func TestGovernorRestrictionWaveAndStaleSuccessSurviveRestart(t *testing.T) {
 	g, now, path := governorFixture(t, Limits{})
 	first := testCredential()

@@ -19,6 +19,8 @@ type WorkBuddyRuntime struct {
 	Governor   *workbuddy.Governor
 	Transports *workbuddy.Transports
 	Limiter    *workbuddy.Limiter
+	Policy     *workbuddy.PolicyState
+	Affinity   *workbuddy.Affinity
 	// BaseURL is an injection seam for offline tests, never populated from auth files.
 	BaseURL     string
 	StateDir    string
@@ -33,7 +35,7 @@ func NewWorkBuddyRuntime(cfg config.WorkBuddyConfig) (*WorkBuddyRuntime, error) 
 	if cfg.StateDir == "" {
 		return nil, fmt.Errorf("workbuddy: state-dir is required")
 	}
-	r := &WorkBuddyRuntime{Transports: workbuddy.NewTransports(256, nil), StateDir: filepath.Clean(cfg.StateDir), auths: make(map[string]*coreauth.Auth)}
+	r := &WorkBuddyRuntime{Affinity: workbuddy.NewAffinity(nil), Policy: workbuddy.NewPolicyState(nil), Transports: workbuddy.NewTransports(256, nil), StateDir: filepath.Clean(cfg.StateDir), auths: make(map[string]*coreauth.Auth)}
 	var err error
 	r.Governor, err = workbuddy.OpenGovernor(filepath.Join(r.StateDir, "risk.json"), workbuddy.GovernorOptions{})
 	if err != nil {
@@ -79,6 +81,19 @@ func (r *WorkBuddyRuntime) BindManager(manager *coreauth.Manager) {
 func (r *WorkBuddyRuntime) Configure(cfg config.WorkBuddyConfig) error {
 	if filepath.Clean(cfg.StateDir) != r.StateDir {
 		return fmt.Errorf("workbuddy: changing state-dir requires a process restart")
+	}
+	for _, product := range cfg.AutoSwitchProducts {
+		if product != string(workbuddy.Desktop) && product != string(workbuddy.VSCode) && product != string(workbuddy.CLI) {
+			return fmt.Errorf("workbuddy: invalid automatic product selection")
+		}
+	}
+	if cfg.AffinityMaxMessages != nil && *cfg.AffinityMaxMessages < 0 || cfg.AffinityPageSize != nil && *cfg.AffinityPageSize < 0 {
+		return fmt.Errorf("workbuddy: affinity limits cannot be negative")
+	}
+	switch cfg.Prompt.Mode {
+	case "", "passthrough", "custom", "append":
+	default:
+		return fmt.Errorf("workbuddy: invalid prompt mode")
 	}
 	if cfg.QueueSeconds < 0 {
 		return fmt.Errorf("workbuddy: queue-seconds cannot be negative")
@@ -148,17 +163,13 @@ func (r *WorkBuddyRuntime) Current(a *coreauth.Auth) *coreauth.Auth {
 	return a
 }
 func (r *WorkBuddyRuntime) Accounts() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	unique := make(map[string]bool)
-	for _, a := range r.auths {
-		c, err := WorkBuddyCredential(a)
-		if err == nil && !c.Disabled {
-			unique[workbuddy.RiskAccountKey(c)] = true
-		}
+	for _, c := range r.Credentials() {
+		unique[workbuddy.RiskAccountKey(c)] = true
 	}
 	return len(unique)
 }
+
 func (r *WorkBuddyRuntime) Refresh(ctx context.Context, a *coreauth.Auth, proxy string) (*coreauth.Auth, error) {
 	a = r.Current(a)
 	c, err := WorkBuddyCredential(a)
@@ -210,4 +221,65 @@ func (r *WorkBuddyRuntime) Refresh(ctx context.Context, a *coreauth.Auth, proxy 
 		return nil, fmt.Errorf("workbuddy: refreshed credential not installed")
 	}
 	return current, nil
+}
+
+func (r *WorkBuddyRuntime) Credentials() []workbuddy.Credential {
+	r.mu.Lock()
+	manager := r.manager
+	var records []*coreauth.Auth
+	if manager == nil {
+		for _, a := range r.auths {
+			records = append(records, a.Clone())
+		}
+	}
+	r.mu.Unlock()
+	if manager != nil {
+		records = manager.List()
+	}
+	out := make([]workbuddy.Credential, 0, len(records))
+	for _, a := range records {
+		if c, err := WorkBuddyCredential(a); err == nil && !c.Disabled {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+func (r *WorkBuddyRuntime) AllFreeCapped(realm workbuddy.Realm, model string) bool {
+	found := false
+	for _, c := range r.Credentials() {
+		if c.Realm != realm {
+			continue
+		}
+		found = true
+		if !r.Governor.Capped(c, model) {
+			return false
+		}
+	}
+	return found
+}
+func (r *WorkBuddyRuntime) SwitchProduct(ctx context.Context, a *coreauth.Auth, product workbuddy.Product) (*coreauth.Auth, error) {
+	original := r.Current(a)
+	if original == nil || original.Disabled {
+		return nil, fmt.Errorf("workbuddy: credential removed or disabled")
+	}
+	updated := original.Clone()
+	updated.Metadata["product"] = string(product)
+	updated.UpdatedAt = time.Now()
+	r.mu.Lock()
+	manager, save := r.manager, r.Save
+	r.mu.Unlock()
+	if manager != nil {
+		committed, err := manager.UpdatePreparedAuth(ctx, original, updated)
+		if err != nil {
+			return nil, err
+		}
+		if committed == nil || committed.Disabled || committed.Metadata["product"] != string(product) {
+			return nil, fmt.Errorf("workbuddy: product change not committed")
+		}
+		updated = committed
+	} else if err := save(ctx, original, updated); err != nil {
+		return nil, err
+	}
+	r.Track(updated)
+	return r.Current(updated), nil
 }
