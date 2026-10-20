@@ -1,6 +1,6 @@
 # WorkBuddy native provider
 
-This implementation is being built for the isolated `cliproxyapi-wb` test
+This implementation supports the isolated `cliproxyapi-wb` test
 service. The existing `cliproxy` deployment and its accounts are outside its
 scope. No real WorkBuddy account has been used for validation.
 
@@ -46,8 +46,8 @@ provided.
 
 ## Implementation status
 
-The credential/transport foundation is merged. Core execution is being developed
-in `feat/workbuddy-proxy`; deployment is still pending. Offline coverage now
+The credential/transport foundation, core executor and governed maintenance
+jobs are merged. Offline coverage
 includes the native executor, OpenAI Chat/Responses, Claude and Gemini response
 translation, SSE/nonstream collection, parallel tool calls, usage accounting,
 401 refresh with persistence before replay, and SDK-scoped retry decisions.
@@ -65,7 +65,7 @@ Native credential `models` explicitly restrict the published models.
 The governor and transport pools are shared across executor replacements.
 Configuration reloads preserve cooldowns, restrictions and usage. Changing the
 state directory requires a restart; the old directory must be migrated explicitly.
-Only one process may own a state directory. The isolated deployment will use a
+Only one process may own a state directory. The isolated deployment uses a
 single replica and its own PVC.
 
 Model entitlement error `11158` is retained as region/model evidence for 24 hours,
@@ -119,9 +119,16 @@ against the last observed balance, protecting the reserve between refreshes.
 The persisted balance snapshot retains the vendor's original observation.
 
 Automated international web activity and actual task-specific growth actions
-remain follow-up work. The isolated deployment and real-account validation are
-still pending; this implementation must not be described as fully validated
-upstream parity.
+remain follow-up work. Real-account validation is still pending; this
+implementation must not be described as fully validated upstream parity.
+
+The isolated service is managed by
+[Qortex-GitOps PR #1011](https://github.com/CorgiCortex/Qortex-GitOps/pull/1011).
+It has a separate namespace, API key, PVC and empty provider-auth directory,
+with all background jobs disabled. There is no public ingress. Operator access
+uses `kubectl -n cliproxyapi-wb port-forward service/cliproxyapi-wb 18317:8317`.
+The existing `litellm/cliproxy` deployment and its provider accounts are not
+referenced by this application.
 
 An explicit v8 configuration enables the provider:
 
@@ -212,6 +219,8 @@ go build -o test-output ./cmd/server
 rm test-output
 ```
 
-The local host currently has no C compiler, so `-race` requires a separate
-runner with CGO enabled. Run the race detector there before merging provider
-implementation.
+The development host has no C compiler, so `-race` runs on a separate runner
+with CGO enabled. Full repository CI, the WorkBuddy race checks and the isolated
+image build passed on source revision
+`462179c9d4e910064a6a9cf21a393b3be7d45e15`. These offline checks do not replace
+dedicated-account acceptance.
