@@ -9,10 +9,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -29,9 +30,10 @@ type ConvertOpenAIResponseToGeminiParams struct {
 
 // ToolCallAccumulator holds the state for accumulating tool call data
 type ToolCallAccumulator struct {
-	ID        string
-	Name      string
-	Arguments strings.Builder
+	ID               string
+	Name             string
+	Arguments        strings.Builder
+	ThoughtSignature string
 }
 
 // ConvertOpenAIResponseToGemini converts OpenAI Chat Completions streaming response format to Gemini API format.
@@ -144,7 +146,9 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 			if len(chunkOutputs) > 0 {
 				results = append(results, chunkOutputs...)
-				return true
+				if !delta.Get("tool_calls").Exists() {
+					return true
+				}
 			}
 
 			// Handle tool calls delta
@@ -154,6 +158,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					toolID := toolCall.Get("id").String()
 					toolType := toolCall.Get("type").String()
 					function := toolCall.Get("function")
+					thoughtSig := openAIToolCallThoughtSignature(toolCall)
 
 					// Skip non-function tool calls explicitly marked as other types.
 					if toolType != "" && toolType != "function" {
@@ -161,7 +166,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					}
 
 					// OpenAI streaming deltas may omit the type field while still carrying function data.
-					if !function.Exists() {
+					if !function.Exists() && thoughtSig == "" {
 						return true
 					}
 
@@ -193,22 +198,35 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 						acc.Arguments.WriteString(functionArgs)
 					}
 
+					if thoughtSig != "" {
+						acc.ThoughtSignature = thoughtSig
+					}
+
 					return true
 				})
 
-				// Don't output anything for tool call deltas - wait for completion
-				return true
+				if finishReason := choice.Get("finish_reason"); finishReason.Type != gjson.String || finishReason.String() == "" {
+					// Don't output anything for tool call deltas - wait for completion
+					return true
+				}
 			}
 
 			// Handle finish reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
+			if finishReason := choice.Get("finish_reason"); finishReason.Type == gjson.String && finishReason.String() != "" {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
 				// If we have accumulated tool calls, output them now
 				if len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator) > 0 {
+					toolIndices := make([]int, 0, len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator))
+					for toolIndex := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
+						toolIndices = append(toolIndices, toolIndex)
+					}
+					sort.Ints(toolIndices)
+
 					partIndex := 0
-					for _, accumulator := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
+					for _, toolIndex := range toolIndices {
+						accumulator := (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator[toolIndex]
 						idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
 						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
 						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
@@ -217,6 +235,10 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 						}
 						template, _ = sjson.SetBytes(template, namePath, accumulator.Name)
 						template, _ = sjson.SetRawBytes(template, argsPath, []byte(parseArgsToObjectRaw(accumulator.Arguments.String())))
+						if accumulator.ThoughtSignature != "" {
+							sigPath := fmt.Sprintf("candidates.0.content.parts.%d.thoughtSignature", partIndex)
+							template, _ = sjson.SetBytes(template, sigPath, accumulator.ThoughtSignature)
+						}
 						partIndex++
 					}
 
@@ -240,6 +262,20 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 		return results
 	}
 	return [][]byte{}
+}
+
+func openAIToolCallThoughtSignature(toolCall gjson.Result) string {
+	for _, path := range []string{
+		"extra_content.google.thought_signature",
+		"function.extra_content.google.thought_signature",
+		"thoughtSignature",
+		"thought_signature",
+	} {
+		if sig := toolCall.Get(path); sig.Exists() && sig.String() != "" {
+			return sig.String()
+		}
+	}
+	return ""
 }
 
 // mapOpenAIFinishReasonToGemini maps OpenAI finish reasons to Gemini finish reasons
@@ -538,6 +574,8 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
+	var allParts [][]byte
+
 	// Process choices
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
 		choices.ForEach(func(choiceIndex, choice gjson.Result) bool {
@@ -552,6 +590,12 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 			}
 
 			partIndex := 0
+			ensurePart := func(idx int) []byte {
+				for len(allParts) <= idx {
+					allParts = append(allParts, []byte(`{}`))
+				}
+				return allParts[idx]
+			}
 
 			// Handle reasoning content before visible text
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
@@ -559,15 +603,19 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 					if reasoningText == "" {
 						continue
 					}
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.thought", partIndex), true)
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), reasoningText)
+					part := ensurePart(partIndex)
+					part, _ = sjson.SetBytes(part, "thought", true)
+					part, _ = sjson.SetBytes(part, "text", reasoningText)
+					allParts[partIndex] = part
 					partIndex++
 				}
 			}
 
 			// Handle content first
 			if content := message.Get("content"); content.Exists() && content.String() != "" {
-				out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), content.String())
+				part := ensurePart(partIndex)
+				part, _ = sjson.SetBytes(part, "text", content.String())
+				allParts[partIndex] = part
 				partIndex++
 			}
 
@@ -580,14 +628,16 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 						functionArgs := function.Get("arguments").String()
 						functionID := toolCall.Get("id").String()
 
-						idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
-						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
-						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
+						part := ensurePart(partIndex)
 						if functionID != "" {
-							out, _ = sjson.SetBytes(out, idPath, functionID)
+							part, _ = sjson.SetBytes(part, "functionCall.id", functionID)
 						}
-						out, _ = sjson.SetBytes(out, namePath, functionName)
-						out, _ = sjson.SetRawBytes(out, argsPath, []byte(parseArgsToObjectRaw(functionArgs)))
+						part, _ = sjson.SetBytes(part, "functionCall.name", functionName)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(parseArgsToObjectRaw(functionArgs)))
+						if thoughtSig := openAIToolCallThoughtSignature(toolCall); thoughtSig != "" {
+							part, _ = sjson.SetBytes(part, "thoughtSignature", thoughtSig)
+						}
+						allParts[partIndex] = part
 						partIndex++
 					}
 					return true
@@ -595,7 +645,7 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 			}
 
 			// Handle finish reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
+			if finishReason := choice.Get("finish_reason"); finishReason.Type == gjson.String && finishReason.String() != "" {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				out, _ = sjson.SetBytes(out, "candidates.0.finishReason", geminiFinishReason)
 			}
@@ -605,6 +655,10 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 			return true
 		})
+
+		if len(allParts) > 0 {
+			out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts", translatorcommon.JoinRawArray(allParts))
+		}
 	}
 
 	// Handle usage information
