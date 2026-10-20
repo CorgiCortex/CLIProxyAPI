@@ -1,0 +1,31 @@
+name: WorkBuddy offline checks
+
+on:
+  pull_request:
+    paths:
+      - 'internal/workbuddy/**'
+      - 'internal/cmd/workbuddy_login.go'
+      - 'internal/runtime/executor/workbuddy*'
+      - 'internal/runtime/executor/helps/workbuddy*'
+      - 'internal/watcher/synthesizer/**'
+      - 'sdk/auth/**'
+      - 'sdk/cliproxy/**'
+      - '.github/workflows/workbuddy-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test fixture protocols and credential lifecycle under the race detector
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -timeout 120s ./internal/workbuddy ./sdk/auth ./internal/watcher/synthesizer
