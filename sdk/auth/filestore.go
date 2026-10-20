@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/workbuddy"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -113,6 +114,18 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if handled, errCodex := cliproxyauth.PersistCodexAuthFile(ctx, path, auth); handled {
 		if errCodex != nil {
 			return "", errCodex
+		}
+	} else if auth.Provider == "workbuddy" {
+		raw, errMarshal := json.Marshal(auth.Metadata)
+		if errMarshal != nil {
+			return "", fmt.Errorf("workbuddy: encode credential metadata: %w", errMarshal)
+		}
+		if _, errCredential := workbuddy.DecodeCredential(raw); errCredential != nil {
+			return "", errCredential
+		}
+		auth.Metadata["disabled"] = auth.Disabled
+		if errSave := workbuddy.WriteJSON(path, auth.Metadata); errSave != nil {
+			return "", errSave
 		}
 	} else {
 		switch {
